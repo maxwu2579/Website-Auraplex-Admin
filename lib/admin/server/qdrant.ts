@@ -3,6 +3,9 @@ import {
   getQdrantConfig,
   type QdrantConfig,
 } from '@/lib/admin/server/config';
+import type { IngestLine } from '@/lib/admin/upload-domain';
+import { parseUploadObjectKey } from '@/lib/admin/object-key';
+import { parseQdrantSourceKey } from '@/lib/admin/source-key';
 
 export interface QdrantEvidenceAdapter {
   hasProcessedEvidence(sourceKey: string): Promise<boolean>;
@@ -12,23 +15,27 @@ export interface QdrantEvidenceAdapter {
 type QdrantScroller = Pick<QdrantClient, 'scroll' | 'delete'>;
 export type QdrantCollectionResolver = (sourceKey: string) => string;
 
-// Current compatibility behavior only. The confirmed per-line collection
-// mapping can replace this resolver without changing status/delete callers.
-export function currentCollectionResolver(collection: string): QdrantCollectionResolver {
-  return () => collection;
+export const QDRANT_COLLECTIONS: Readonly<Record<IngestLine, string>> = Object.freeze({
+  machines: 'auraplex_machines',
+  software: 'auraplex_software',
+  consulting: 'auraplex_consulting',
+});
+
+/**
+ * The single collection resolver shared by status and delete. It derives the
+ * ingest line from the stored key inside `{bucket}/{key}`. Unknown or legacy
+ * prefixes throw; there is no default collection and no all-collection scan.
+ */
+export function qdrantCollectionForSourceKey(sourceKey: string): string {
+  const { key } = parseQdrantSourceKey(sourceKey);
+  return QDRANT_COLLECTIONS[parseUploadObjectKey(key).ingestLine];
 }
 
 export class QdrantRestEvidenceAdapter implements QdrantEvidenceAdapter {
   constructor(
     private readonly client: QdrantScroller,
-    collection: string | QdrantCollectionResolver,
-  ) {
-    this.collectionForSourceKey = typeof collection === 'string'
-      ? currentCollectionResolver(collection)
-      : collection;
-  }
-
-  private readonly collectionForSourceKey: QdrantCollectionResolver;
+    private readonly collectionForSourceKey: QdrantCollectionResolver = qdrantCollectionForSourceKey,
+  ) {}
 
   async hasProcessedEvidence(sourceKey: string): Promise<boolean> {
     const result = await this.client.scroll(this.collectionForSourceKey(sourceKey), {
@@ -58,6 +65,5 @@ export function createQdrantAdapter(
 ): QdrantEvidenceAdapter {
   return new QdrantRestEvidenceAdapter(
     new QdrantClient({ url: config.url, apiKey: config.apiKey }),
-    config.collection,
   );
 }

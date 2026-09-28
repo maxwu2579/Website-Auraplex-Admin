@@ -200,11 +200,6 @@ export const MACHINES: Machine[] = MACHINES_RAW.map((m) => {
   };
 });
 
-/** Product categories derived from the catalogue instead of maintained twice. */
-export const PRODUCT_CATEGORIES: readonly Category[] = Object.freeze(
-  Array.from(new Set(MACHINES.map((machine) => machine.category))),
-);
-
 export function getMachine(slug: string): Machine | null {
   return MACHINES.find((m) => m.slug === slug) ?? null;
 }

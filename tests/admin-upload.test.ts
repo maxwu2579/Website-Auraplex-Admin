@@ -6,11 +6,22 @@ import {
   CLIENT_UPLOAD_MAX_MB,
   effectiveClientUploadMaxMb,
   UPLOAD_ERROR_STATUS,
-  type ProductLine,
 } from '../lib/admin/upload-contract';
 import {
+  BUSINESS_LINES,
+  BUSINESS_TO_INGEST_LINE,
+  INGEST_LINES,
+  ingestLineForBusinessLine,
+  type IngestLine,
+} from '../lib/admin/upload-domain';
+import { buildUploadObjectKey, parseUploadObjectKey } from '../lib/admin/object-key';
+import { parseQdrantSourceKey, toQdrantSourceKey } from '../lib/admin/source-key';
+import { UPLOAD_PRODUCTS } from '../lib/admin/upload-products';
+import {
   buildUploadObjectLocation,
-  createUploadByteLimitStream,
+  createUploadByteCounter,
+  parseBusinessLine,
+  prepareUploadRequest,
   resolveUploadMedia,
   resolveUploadProduct,
   sanitizeUploadFilename,
@@ -51,10 +62,52 @@ function expectContractError(
   });
 }
 
-test('resolves a real catalogue product by ID and category', () => {
+test('exposes exactly five business lines and three ingest lines', () => {
+  assert.deepEqual([...BUSINESS_LINES], ['labelling', 'packaging', 'automation', 'software', 'consulting']);
+  assert.deepEqual([...INGEST_LINES], ['machines', 'software', 'consulting']);
+  for (const line of BUSINESS_LINES) assert.equal(parseBusinessLine(line), line);
+  expectContractError(() => parseBusinessLine('machines'), 'MALFORMED_REQUEST', 400);
+});
+
+test('maps business lines to the confirmed ingest lines', () => {
+  assert.deepEqual({ ...BUSINESS_TO_INGEST_LINE }, {
+    labelling: 'machines',
+    packaging: 'machines',
+    automation: 'machines',
+    software: 'software',
+    consulting: 'consulting',
+  });
+  assert.equal(ingestLineForBusinessLine('labelling'), 'machines');
+  assert.equal(ingestLineForBusinessLine('packaging'), 'machines');
+  assert.equal(ingestLineForBusinessLine('automation'), 'machines');
+  assert.equal(ingestLineForBusinessLine('software'), 'software');
+  assert.equal(ingestLineForBusinessLine('consulting'), 'consulting');
+});
+
+test('resolves a real catalogue product by ID and business line', () => {
   const product = resolveUploadProduct('6470625', 'labelling');
   assert.equal(product.slug, 'flexy-applicator');
-  assert.equal(product.category, 'labelling');
+  assert.equal(product.businessLine, 'labelling');
+});
+
+test('software and consulting have no invented products and reject uploads', () => {
+  for (const line of ['software', 'consulting'] as const) {
+    assert.equal(UPLOAD_PRODUCTS.some((product) => product.businessLine === line), false);
+    expectContractError(() => resolveUploadProduct('6470625', line), 'INVALID_PRODUCT', 400);
+  }
+  for (const line of ['labelling', 'packaging', 'automation'] as const) {
+    assert.equal(UPLOAD_PRODUCTS.some((product) => product.businessLine === line), true);
+  }
+});
+
+test('every catalogue product slug is a valid object-key segment', () => {
+  for (const product of UPLOAD_PRODUCTS) {
+    assert.doesNotThrow(() => buildUploadObjectKey({
+      ingestLine: ingestLineForBusinessLine(product.businessLine),
+      productSlug: product.slug,
+      safeFilename: 'manual.pdf',
+    }), product.slug);
+  }
 });
 
 test('rejects an unknown product ID', () => {
@@ -135,28 +188,76 @@ test('rejects unsupported MIME types and extension mismatches', () => {
   }
 });
 
-test('builds the deterministic bucket and object key', () => {
-  const productLine: ProductLine = 'labelling';
+test('builds {ingest_line}/{product.slug}/{file} and a bucket/key source_key', () => {
   const media = resolveUploadMedia('application/pdf', 'manual.pdf');
   const location = buildUploadObjectLocation({
-    productLine,
+    ingestLine: 'machines',
     productSlug: 'flexy-applicator',
-    safeFilename: 'manual.pdf',
+    safeFilename: 'bottom-labelling-machine-brochure.pdf',
     media,
   });
 
   assert.deepEqual(location, {
     bucket: 'auraplex-raw-pdf',
-    key: 'labelling/flexy-applicator/manual.pdf',
-    sourceKey: 'labelling/flexy-applicator/manual.pdf',
+    key: 'machines/flexy-applicator/bottom-labelling-machine-brochure.pdf',
+    sourceKey: 'auraplex-raw-pdf/machines/flexy-applicator/bottom-labelling-machine-brochure.pdf',
   });
+  assert.equal(location.key.split('/').length, 3);
+});
+
+test('prepared uploads use the mapped ingest line and keep product.slug', () => {
+  const prepared = prepareUploadRequest(new Headers({
+    'content-type': 'application/pdf',
+    'x-product-line': 'labelling',
+    'x-product-id': '6470625',
+    'x-upload-filename': encodeURIComponent('Bottom Labelling Machine Brochure.pdf'),
+    'x-csrf-token': 'token',
+  }));
+  assert.equal(prepared.ingestLine, 'machines');
+  assert.equal(prepared.location.key, 'machines/flexy-applicator/bottom-labelling-machine-brochure.pdf');
+  assert.equal(prepared.metadata.declaredSize, undefined);
+});
+
+test('source_key is built once from bucket and key and round-trips', () => {
+  const location = { bucket: 'auraplex-raw-video', key: 'software/some-product/demo.mp4' } as const;
+  const sourceKey = toQdrantSourceKey(location);
+  assert.equal(sourceKey, 'auraplex-raw-video/software/some-product/demo.mp4');
+  assert.deepEqual(parseQdrantSourceKey(sourceKey), location);
+  expectContractError(() => parseQdrantSourceKey('machines/p/manual.pdf'), 'MALFORMED_REQUEST', 400);
+  expectContractError(() => parseQdrantSourceKey('unknown-bucket/machines/p/manual.pdf'), 'MALFORMED_REQUEST', 400);
+});
+
+test('object keys accept only ingest prefixes and reject legacy or extra paths', () => {
+  for (const ingestLine of ['machines', 'software', 'consulting'] as const) {
+    assert.deepEqual(parseUploadObjectKey(`${ingestLine}/product-a/manual.pdf`), {
+      ingestLine,
+      productSlug: 'product-a',
+      safeFilename: 'manual.pdf',
+    });
+  }
+  for (const key of [
+    'labelling/flexy-applicator/manual.pdf',
+    'packaging/p/manual.pdf',
+    'unknown/p/manual.pdf',
+    'machines/p/extra/manual.pdf',
+    'machines/manual.pdf',
+    'machines/../manual.pdf',
+    'machines/p/../manual.pdf',
+  ]) {
+    expectContractError(() => parseUploadObjectKey(key), 'MALFORMED_REQUEST', 400);
+  }
+  expectContractError(
+    () => buildUploadObjectKey({ ingestLine: 'labelling' as IngestLine, productSlug: 'p', safeFilename: 'manual.pdf' }),
+    'MALFORMED_REQUEST',
+    400,
+  );
 });
 
 test('rejects unsafe object key components', () => {
   const media = resolveUploadMedia('application/pdf', 'manual.pdf');
   expectContractError(
     () => buildUploadObjectLocation({
-      productLine: 'labelling',
+      ingestLine: 'machines',
       productSlug: '../escape',
       safeFilename: 'manual.pdf',
       media,
@@ -187,60 +288,66 @@ test('server upload limit is runtime-only and UI ceiling is independently bounde
   assert.equal(effectiveClientUploadMaxMb(500), 500);
 });
 
-test('counts streamed bytes without buffering the complete upload', async () => {
-  const allowed = new ReadableStream<Uint8Array>({
+function chunkStream(chunks: Uint8Array[]) {
+  return new ReadableStream<Uint8Array>({
     start(controller) {
-      controller.enqueue(new Uint8Array(3));
-      controller.enqueue(new Uint8Array(2));
+      for (const chunk of chunks) controller.enqueue(chunk);
       controller.close();
     },
   });
-  const allowedReader = allowed.pipeThrough(createUploadByteLimitStream(5)).getReader();
-  let allowedBytes = 0;
-  while (true) {
-    const { done, value } = await allowedReader.read();
-    if (done) break;
-    allowedBytes += value.byteLength;
-  }
-  assert.equal(allowedBytes, 5);
+}
 
-  const oversized = new ReadableStream<Uint8Array>({
-    start(controller) {
-      controller.enqueue(new Uint8Array(6));
-      controller.close();
-    },
-  });
-  const oversizedReader = oversized
-    .pipeThrough(createUploadByteLimitStream(5))
-    .getReader();
-  await assert.rejects(oversizedReader.read(), (error: unknown) => {
+async function drain(stream: ReadableStream<Uint8Array>): Promise<number> {
+  const reader = stream.getReader();
+  let bytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) return bytes;
+    bytes += value.byteLength;
+  }
+}
+
+async function assertStreamRejects(stream: ReadableStream<Uint8Array>, code: string, status: number) {
+  await assert.rejects(drain(stream), (error: unknown) => {
     assert.ok(error instanceof UploadContractError);
-    assert.equal(error.code, 'FILE_TOO_LARGE');
-    assert.equal(error.status, 413);
+    assert.equal(error.code, code);
+    assert.equal(error.status, status);
     return true;
   });
+}
+
+test('counts streamed bytes without buffering and exposes the actual total', async () => {
+  const counter = createUploadByteCounter({ maxBytes: 5 });
+  assert.equal(await drain(chunkStream([new Uint8Array(3), new Uint8Array(2)]).pipeThrough(counter.stream)), 5);
+  assert.equal(counter.receivedBytes, 5);
+
+  const oversized = createUploadByteCounter({ maxBytes: 5 });
+  await assertStreamRejects(chunkStream([new Uint8Array(6)]).pipeThrough(oversized.stream), 'FILE_TOO_LARGE', 413);
 });
 
 test('rejects declared and actual byte count mismatches with a stable 400', async () => {
   for (const chunks of [[new Uint8Array(4)], [new Uint8Array(2)]]) {
-    const source = new ReadableStream<Uint8Array>({
-      start(controller) {
-        for (const chunk of chunks) controller.enqueue(chunk);
-        controller.close();
-      },
-    });
-    const reader = source.pipeThrough(createUploadByteLimitStream(10, 3)).getReader();
-    await assert.rejects(async () => {
-      while (!(await reader.read()).done) {
-        // Drain the stream so both overflow and short-body checks execute.
-      }
-    }, (error: unknown) => {
-      assert.ok(error instanceof UploadContractError);
-      assert.equal(error.code, 'SIZE_MISMATCH');
-      assert.equal(error.status, 400);
-      return true;
-    });
+    const counter = createUploadByteCounter({ maxBytes: 10, expectedBytes: 3 });
+    await assertStreamRejects(chunkStream(chunks).pipeThrough(counter.stream), 'SIZE_MISMATCH', 400);
   }
+});
+
+test('without Content-Length the actual stream is authoritative', async () => {
+  const valid = createUploadByteCounter({ maxBytes: 10 });
+  assert.equal(await drain(chunkStream([new Uint8Array(4), new Uint8Array(3)]).pipeThrough(valid.stream)), 7);
+  assert.equal(valid.receivedBytes, 7);
+
+  const empty = createUploadByteCounter({ maxBytes: 10 });
+  await assertStreamRejects(chunkStream([]).pipeThrough(empty.stream), 'EMPTY_FILE', 400);
+
+  const oversized = createUploadByteCounter({ maxBytes: 10 });
+  await assertStreamRejects(chunkStream([new Uint8Array(6), new Uint8Array(6)]).pipeThrough(oversized.stream), 'FILE_TOO_LARGE', 413);
+  assert.equal(oversized.receivedBytes, 12);
+});
+
+test('byte counter enforces the reserved hourly volume as a rate limit', async () => {
+  const counter = createUploadByteCounter({ maxBytes: 100, volumeAllowanceBytes: 5 });
+  await assertStreamRejects(chunkStream([new Uint8Array(4), new Uint8Array(4)]).pipeThrough(counter.stream), 'RATE_LIMITED', 429);
 });
 
 test('sniffs every accepted signature and preserves every stream byte', async () => {
@@ -345,17 +452,14 @@ test('rejects MIME spoofing and unsupported binary content', async () => {
   );
 });
 
-test('rejects missing and malformed content lengths', () => {
-  expectContractError(
-    () => validateDeclaredSize(null),
-    'MISSING_CONTENT_LENGTH',
-    400,
-  );
-  expectContractError(
-    () => validateDeclaredSize('-1'),
-    'INVALID_CONTENT_LENGTH',
-    400,
-  );
+test('Content-Length is optional but validated when present', () => {
+  assert.equal(validateDeclaredSize(null), undefined);
+  assert.equal(validateDeclaredSize(''), undefined);
+  assert.equal(validateDeclaredSize('1234'), 1234);
+  for (const invalid of ['-1', 'abc', '1.5', '1e3', '12 34']) {
+    expectContractError(() => validateDeclaredSize(invalid), 'INVALID_CONTENT_LENGTH', 400);
+  }
+  expectContractError(() => validateDeclaredSize('99999999999999999999'), 'INVALID_CONTENT_LENGTH', 400);
 });
 
 test('serializes stable API errors', () => {

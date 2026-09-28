@@ -5,6 +5,7 @@ import {
   type UploadMediaRoute,
   type UploadStatus,
 } from '@/lib/admin/upload-contract';
+import { parseUploadObjectKey } from '@/lib/admin/object-key';
 import { toQdrantSourceKey } from '@/lib/admin/source-key';
 import type { QdrantEvidenceAdapter } from '@/lib/admin/server/qdrant';
 import type { StoredObject } from '@/lib/admin/server/storage';
@@ -12,12 +13,15 @@ import { UPLOAD_METADATA } from '@/lib/admin/server/object-metadata';
 
 export function deriveUploadStatus(input: {
   stored: boolean;
+  /** False when the key is outside the confirmed ingest taxonomy. */
+  routable?: boolean;
   ingestionCapability?: UploadMediaRoute['ingestionCapability'];
   processedEvidence: boolean;
   explicitFailure?: boolean;
 }): UploadStatus {
   if (input.explicitFailure) return 'failed';
   if (!input.stored) return 'unsupported';
+  if (input.routable === false) return 'unsupported';
   if (input.ingestionCapability === 'deferred') return 'pending';
   if (input.ingestionCapability !== 'supported') return 'unsupported';
   return input.processedEvidence ? 'processed' : 'pending';
@@ -30,6 +34,15 @@ function fallbackUploadId(object: StoredObject): string {
     .slice(0, 24);
 }
 
+function isRoutableObjectKey(key: string): boolean {
+  try {
+    parseUploadObjectKey(key);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function buildRecentUpload(
   object: StoredObject,
   qdrant: QdrantEvidenceAdapter | null,
@@ -38,7 +51,10 @@ export async function buildRecentUpload(
   const extension = filename.split('.').pop()?.toLowerCase() ?? '';
   const media = uploadMediaForExtension(extension);
   const sourceKey = toQdrantSourceKey(object);
-  const processedEvidence = qdrant && media?.ingestionCapability === 'supported'
+  // Legacy/unknown prefixes are reported explicitly instead of being routed
+  // to a guessed collection.
+  const routable = isRoutableObjectKey(object.key);
+  const processedEvidence = routable && qdrant && media?.ingestionCapability === 'supported'
     ? await qdrant.hasProcessedEvidence(sourceKey)
     : false;
 
@@ -53,6 +69,7 @@ export async function buildRecentUpload(
     ingestionCapability: media?.ingestionCapability ?? 'deferred',
     status: deriveUploadStatus({
       stored: true,
+      routable,
       ingestionCapability: media?.ingestionCapability,
       processedEvidence,
     }),

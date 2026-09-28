@@ -1,16 +1,17 @@
 'use client';
 
 import { CheckCircle2, FileText, Film, Image as ImageIcon, UploadCloud, X } from 'lucide-react';
-import type { DragEvent, RefObject } from 'react';
-import type { Category } from '@/lib/catalog';
-import { UPLOAD_INPUT_ACCEPT, type RecentUpload, type UiUploadQueueStatus } from '@/lib/admin/upload-contract';
+import { useDropzone } from 'react-dropzone';
+import { UPLOAD_DROPZONE_ACCEPT, type RecentUpload, type UiUploadQueueStatus } from '@/lib/admin/upload-contract';
+import {
+  BUSINESS_LINE_LABELS,
+  BUSINESS_LINES,
+  ingestLineForBusinessLine,
+  type BusinessLine,
+} from '@/lib/admin/upload-domain';
+import type { UploadProduct } from '@/lib/admin/upload-products';
 
-export type ProductOption = {
-  id: string;
-  name: string;
-  slug: string;
-  category: Category;
-};
+export type ProductOption = UploadProduct;
 
 export type QueuedFile = {
   id: string;
@@ -21,64 +22,83 @@ export type QueuedFile = {
   error?: string;
 };
 
-export function ProductSelector({ productLine, productId, productLines, filteredProducts, selectedProduct, onProductLineChange, onProductChange }: {
-  productLine: Category | '';
+export function ProductSelector({ businessLine, productId, products, filteredProducts, selectedProduct, onBusinessLineChange, onProductChange }: {
+  businessLine: BusinessLine | '';
   productId: string;
-  productLines: Category[];
+  products: readonly ProductOption[];
   filteredProducts: ProductOption[];
   selectedProduct?: ProductOption;
-  onProductLineChange: (line: Category | '') => void;
+  onBusinessLineChange: (line: BusinessLine | '') => void;
   onProductChange: (id: string) => void;
 }) {
+  const configured = new Set(products.map((product) => product.businessLine));
+  const lineWithoutProducts = businessLine !== '' && filteredProducts.length === 0;
   return (
     <>
       <div className="grid gap-5 md:grid-cols-2">
         <label className="block">
           <span className="mb-2 block font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-neutral-300)]">
-            Product line <span className="text-[color:var(--color-signal)]">*</span>
+            Business line <span className="text-[color:var(--color-signal)]">*</span>
           </span>
-          <select value={productLine} onChange={(event) => onProductLineChange(event.target.value as Category | '')} className="h-12 w-full border border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)] px-4 text-sm outline-none transition-colors focus:border-[color:var(--color-signal)]">
-            <option value="">Select a product line</option>
-            {productLines.map((line) => <option key={line} value={line}>{line.charAt(0).toUpperCase() + line.slice(1)}</option>)}
+          <select value={businessLine} onChange={(event) => onBusinessLineChange(event.target.value as BusinessLine | '')} className="h-12 w-full border border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)] px-4 text-sm outline-none transition-colors focus:border-[color:var(--color-signal)]">
+            <option value="">Select a business line</option>
+            {BUSINESS_LINES.map((line) => (
+              <option key={line} value={line}>
+                {BUSINESS_LINE_LABELS[line]}{configured.has(line) ? '' : ' (no products yet)'}
+              </option>
+            ))}
           </select>
         </label>
         <label className="block">
           <span className="mb-2 block font-mono text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-neutral-300)]">
             Product <span className="text-[color:var(--color-signal)]">*</span>
           </span>
-          <select value={productId} onChange={(event) => onProductChange(event.target.value)} disabled={!productLine} className="h-12 w-full border border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)] px-4 text-sm outline-none transition-colors focus:border-[color:var(--color-signal)] disabled:cursor-not-allowed disabled:opacity-45">
-            <option value="">{productLine ? 'Select a product' : 'Select a product line first'}</option>
+          <select value={productId} onChange={(event) => onProductChange(event.target.value)} disabled={!businessLine || lineWithoutProducts} className="h-12 w-full border border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)] px-4 text-sm outline-none transition-colors focus:border-[color:var(--color-signal)] disabled:cursor-not-allowed disabled:opacity-45">
+            <option value="">
+              {!businessLine ? 'Select a business line first' : lineWithoutProducts ? 'No products configured yet' : 'Select a product'}
+            </option>
             {filteredProducts.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}
           </select>
         </label>
       </div>
+      {lineWithoutProducts && (
+        <p role="status" className="border-l-2 border-[color:var(--color-warning)] pl-4 text-sm text-[color:var(--color-warning)]">
+          No {BUSINESS_LINE_LABELS[businessLine]} products are configured yet. Uploads for this business line open once real product records exist.
+        </p>
+      )}
       {selectedProduct && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-l-2 border-[color:var(--color-signal)] pl-4 text-sm text-[color:var(--color-neutral-300)]">
           <span className="text-[color:var(--color-paper)]">{selectedProduct.name}</span>
           <span className="font-mono text-xs">ID {selectedProduct.id}</span>
-          <span className="font-mono text-xs">/{selectedProduct.slug}</span>
+          <span className="font-mono text-xs">{ingestLineForBusinessLine(selectedProduct.businessLine)}/{selectedProduct.slug}/</span>
         </div>
       )}
     </>
   );
 }
 
-export function FileDropzone({ fileInputRef, dragActive, onDragActiveChange, onDrop, onFiles }: {
-  fileInputRef: RefObject<HTMLInputElement | null>;
-  dragActive: boolean;
-  onDragActiveChange: (active: boolean) => void;
-  onDrop: (event: DragEvent<HTMLDivElement>) => void;
-  onFiles: (files: FileList) => void;
+export function FileDropzone({ onFiles }: {
+  onFiles: (files: File[]) => void;
 }) {
+  const { getRootProps, getInputProps, isDragActive, open } = useDropzone({
+    accept: UPLOAD_DROPZONE_ACCEPT,
+    multiple: true,
+    // As before, the visible "Browse files" button is the single click and
+    // keyboard control; the surrounding zone is a drop target only.
+    noClick: true,
+    noKeyboard: true,
+    // Pass rejected files on as well, so the panel's own checks give the same
+    // per-file messages for dropped and browsed files. Frontend checks are a
+    // convenience; the server validates every upload.
+    onDrop: (accepted, rejections) => onFiles([...accepted, ...rejections.map(({ file }) => file)]),
+  });
   return (
     <div
-      onDragEnter={(event) => { event.preventDefault(); onDragActiveChange(true); }}
-      onDragOver={(event) => event.preventDefault()}
-      onDragLeave={(event) => { if (event.currentTarget === event.target) onDragActiveChange(false); }}
-      onDrop={onDrop}
-      className={`relative grid min-h-64 place-items-center border border-dashed px-6 py-10 text-center transition-colors ${dragActive
+      {...getRootProps({
+        className: `relative grid min-h-64 place-items-center border border-dashed px-6 py-10 text-center transition-colors ${isDragActive
         ? 'border-[color:var(--color-signal)] bg-[color:var(--color-signal)]/10'
-        : 'border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)]/45 hover:border-[color:var(--color-neutral-400)]'}`}
+        : 'border-[color:var(--color-neutral-600)] bg-[color:var(--color-ink)]/45 hover:border-[color:var(--color-neutral-400)]'}`,
+      })}
     >
       <div>
         <div className="mx-auto grid h-14 w-14 place-items-center border border-[color:var(--color-signal)]/60 text-[color:var(--color-signal)]">
@@ -86,13 +106,10 @@ export function FileDropzone({ fileInputRef, dragActive, onDragActiveChange, onD
         </div>
         <p className="mt-5 font-display text-2xl font-semibold">Drop source files here</p>
         <p className="mt-2 text-sm text-[color:var(--color-neutral-400)]">PDF, DOCX, PNG, JPG or MP4</p>
-        <button type="button" onClick={() => fileInputRef.current?.click()} className="mt-5 font-mono text-xs uppercase tracking-[0.16em] text-[color:var(--color-signal)] underline decoration-[color:var(--color-signal)]/50 underline-offset-4 hover:text-[color:var(--color-signal-bright)]">
+        <button type="button" onClick={open} className="mt-5 font-mono text-xs uppercase tracking-[0.16em] text-[color:var(--color-signal)] underline decoration-[color:var(--color-signal)]/50 underline-offset-4 hover:text-[color:var(--color-signal-bright)]">
           Browse files
         </button>
-        <input ref={fileInputRef} type="file" multiple accept={UPLOAD_INPUT_ACCEPT} className="sr-only" onChange={(event) => {
-          if (event.target.files) onFiles(event.target.files);
-          event.target.value = '';
-        }} />
+        <input {...getInputProps({ 'aria-label': 'Choose source files to upload' })} />
       </div>
     </div>
   );
@@ -206,8 +223,8 @@ export function RecentUploadsPanel({ uploads, notice, canDelete, deletingKey, on
           {[
             ['Pending', 'Stored; PDF awaits processing, other formats await ingestion support', 'var(--color-info)'],
             ['Processed', 'Qdrant source key confirmed', 'var(--color-success)'],
-            ['Failed', 'Confirmed failure signal received', 'var(--color-danger)'],
-            ['Unsupported', 'File type is not accepted', 'var(--color-warning)'],
+            ['Failed', 'Shown only for a confirmed ingestion failure signal (not yet provided by the ingest pipeline)', 'var(--color-danger)'],
+            ['Unsupported', 'File type or storage location is not supported for ingestion', 'var(--color-warning)'],
           ].map(([label, description, color]) => (
             <div key={label} className="flex gap-3 text-xs">
               <span aria-hidden="true" className="mt-1.5 h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: color }} />

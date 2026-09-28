@@ -8,8 +8,31 @@ export const UPLOAD_RATE_LIMITS = {
 
 type UploadEvent = { at: number; bytes: number };
 
+export interface UploadAdmissionRequest {
+  /** Declared Content-Length, when the request carried one. */
+  declaredBytes?: number;
+  /** Runtime per-file maximum; bounds the reservation for unknown lengths. */
+  maxUploadBytes: number;
+}
+
+export interface UploadVolumeReservation {
+  /** Byte volume reserved for this upload; the stream must not exceed it. */
+  readonly allowanceBytes: number;
+  /** Replaces the reservation with the bytes actually received. */
+  settle(actualBytes: number): void;
+}
+
 export interface UploadRateLimiter {
-  consume(userId: string, bytes: number, now?: number): void;
+  /**
+   * Counts exactly one upload request against the request-count limits and
+   * reserves byte volume. Byte volume is settled later from the actual stream,
+   * so a missing Content-Length cannot bypass or zero the volume limit.
+   */
+  admit(userId: string, request: UploadAdmissionRequest, now?: number): UploadVolumeReservation;
+}
+
+function rateLimited(): UploadContractError {
+  return new UploadContractError(429, 'RATE_LIMITED', 'Upload rate limit exceeded');
 }
 
 export class InMemoryUploadRateLimiter implements UploadRateLimiter {
@@ -28,23 +51,40 @@ export class InMemoryUploadRateLimiter implements UploadRateLimiter {
     this.lastSweepAt = now;
   }
 
-  consume(userId: string, bytes: number, now = Date.now()): void {
+  admit(userId: string, request: UploadAdmissionRequest, now = Date.now()): UploadVolumeReservation {
     this.pruneExpired(now);
     const hourAgo = now - 60 * 60 * 1000;
     const minuteAgo = now - 60 * 1000;
     const recent = (this.events.get(userId) ?? []).filter((event) => event.at > hourAgo);
     const minuteCount = recent.filter((event) => event.at > minuteAgo).length;
     const hourBytes = recent.reduce((total, event) => total + event.bytes, 0);
+    const remainingBytes = UPLOAD_RATE_LIMITS.bytesPerHour - hourBytes;
 
     if (
       minuteCount >= UPLOAD_RATE_LIMITS.uploadsPerMinute ||
       recent.length >= UPLOAD_RATE_LIMITS.uploadsPerHour ||
-      hourBytes + bytes > UPLOAD_RATE_LIMITS.bytesPerHour
+      remainingBytes <= 0 ||
+      (request.declaredBytes !== undefined && request.declaredBytes > remainingBytes)
     ) {
-      throw new UploadContractError(429, 'RATE_LIMITED', 'Upload rate limit exceeded');
+      throw rateLimited();
     }
-    recent.push({ at: now, bytes });
+
+    // Unknown length: reserve the most this upload could legitimately use, so
+    // concurrent unknown-length uploads cannot jointly overrun the hour budget.
+    const allowanceBytes = request.declaredBytes ?? Math.min(request.maxUploadBytes, remainingBytes);
+    const event: UploadEvent = { at: now, bytes: allowanceBytes };
+    recent.push(event);
     this.events.set(userId, recent);
+
+    let settled = false;
+    return {
+      allowanceBytes,
+      settle(actualBytes) {
+        if (settled) return;
+        settled = true;
+        event.bytes = Math.max(0, actualBytes);
+      },
+    };
   }
 }
 

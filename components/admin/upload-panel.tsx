@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ChevronRight,
@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/primitives/button';
 import { FileDropzone, ProductSelector, RecentUploadsPanel, UploadQueue, type ProductOption, type QueuedFile } from '@/components/admin/upload-panel-parts';
-import type { Category } from '@/lib/catalog';
+import type { BusinessLine } from '@/lib/admin/upload-domain';
 import {
   ACCEPTED_UPLOAD_EXTENSIONS,
   effectiveClientUploadMaxMb,
@@ -25,6 +25,8 @@ import { canRetryUpload, queueStatusAfterResponse } from '@/lib/admin/upload-ui-
 import { logoutFromKeycloak } from '@/app/admin/upload/actions';
 
 const ACCEPTED_EXTENSIONS = new Set(ACCEPTED_UPLOAD_EXTENSIONS);
+const SESSION_EXPIRED =
+  'Your admin session has expired (30 minutes idle or 12 hours after sign-in). Reload the page to sign in again.';
 
 type Props = {
   products: ProductOption[];
@@ -55,7 +57,7 @@ async function loadRecentUploads(): Promise<{
     if (!response.ok || !body.ok || !('uploads' in body)) {
       return {
         uploads: [],
-        notice: 'error' in body ? body.error : 'Upload status is unavailable',
+        notice: response.status === 401 ? SESSION_EXPIRED : 'error' in body ? body.error : 'Upload status is unavailable',
       };
     }
     return {
@@ -72,34 +74,29 @@ async function loadRecentUploads(): Promise<{
 export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
   const uiMaxUploadMb = effectiveClientUploadMaxMb(serverMaxUploadMb);
   const uiMaxUploadBytes = uiMaxUploadMb * 1024 * 1024;
-  const fileInputRef = useRef<HTMLInputElement>(null);
   const activeUpload = useRef<AbortController | null>(null);
-  const [productLine, setProductLine] = useState<Category | ''>('');
+  const [businessLine, setBusinessLine] = useState<BusinessLine | ''>('');
   const [productId, setProductId] = useState('');
   const [files, setFiles] = useState<QueuedFile[]>([]);
-  const [dragActive, setDragActive] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [uploading, setUploading] = useState(false);
   const [recentUploads, setRecentUploads] = useState<RecentUpload[]>([]);
   const [recentNotice, setRecentNotice] = useState('Checking backend connection…');
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
-  const productLines = useMemo(
-    () => Array.from(new Set(products.map((product) => product.category))),
-    [products],
-  );
-
+  // All five business lines are shown even when the catalogue has no products
+  // for a line yet; product selection stays mandatory for every upload.
   const filteredProducts = useMemo(
-    () => products.filter((product) => product.category === productLine),
-    [productLine, products],
+    () => products.filter((product) => product.businessLine === businessLine),
+    [businessLine, products],
   );
 
-  const selectedProduct = products.find((product) => product.id === productId);
+  const selectedProduct = filteredProducts.find((product) => product.id === productId);
   const uploadCandidates = files.filter(
     (item) => item.status === 'ready' || canRetryUpload(item.status),
   );
   const canPrepareUpload = Boolean(
-    productLine && productId && uploadCandidates.length > 0 && !uploading,
+    businessLine && selectedProduct && uploadCandidates.length > 0 && !uploading,
   );
 
   const refreshRecentUploads = useCallback(async () => {
@@ -118,8 +115,8 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
     return () => { active = false; activeUpload.current?.abort(); };
   }, []);
 
-  function changeProductLine(value: Category | '') {
-    setProductLine(value);
+  function changeBusinessLine(value: BusinessLine | '') {
+    setBusinessLine(value);
     setProductId('');
   }
 
@@ -161,12 +158,6 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
     setNotice(rejected.length > 0 ? rejected.join('. ') : null);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>) {
-    event.preventDefault();
-    setDragActive(false);
-    addFiles(event.dataTransfer.files);
-  }
-
   function removeFile(id: string) {
     setFiles((current) => current.filter((item) => item.id !== id));
   }
@@ -178,7 +169,7 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
   }
 
   async function uploadFiles() {
-    if (!productLine || !productId || !canPrepareUpload) return;
+    if (!businessLine || !selectedProduct || !canPrepareUpload) return;
     setUploading(true);
     setNotice(null);
 
@@ -193,7 +184,9 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
         error?: string;
       };
       if (!csrfResponse.ok || !csrfBody.ok || !csrfBody.csrfToken) {
-        const message = csrfBody.error || 'Authentication or CSRF setup is unavailable';
+        const message = csrfResponse.status === 401
+          ? SESSION_EXPIRED
+          : csrfBody.error || 'Authentication or CSRF setup is unavailable';
         setNotice(message);
         setFiles((current) =>
           current.map((item) =>
@@ -217,8 +210,8 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
             credentials: 'same-origin',
             headers: {
               'Content-Type': media.canonicalMimeType,
-              [UPLOAD_HEADERS.productLine]: productLine,
-              [UPLOAD_HEADERS.productId]: productId,
+              [UPLOAD_HEADERS.productLine]: businessLine,
+              [UPLOAD_HEADERS.productId]: selectedProduct.id,
               [UPLOAD_HEADERS.filename]: encodeURIComponent(item.file.name),
               [UPLOAD_HEADERS.csrfToken]: csrfBody.csrfToken,
             },
@@ -227,12 +220,10 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
           });
           const body = (await response.json()) as UploadApiResponse;
           const status = queueStatusAfterResponse(body);
-          updateFile(item.id, {
-            status,
-            error: body.ok ? undefined : body.error,
-          });
+          const error = body.ok ? undefined : response.status === 401 ? SESSION_EXPIRED : body.error;
+          updateFile(item.id, { status, error });
           if (!response.ok || !body.ok) {
-            setNotice(body.ok ? 'Upload failed' : body.error);
+            setNotice(error ?? 'Upload failed');
           }
         } catch (error) {
           const message = controller.signal.aborted
@@ -257,6 +248,7 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
     try {
       const csrfResponse = await fetch('/api/admin/csrf', { cache: 'no-store', credentials: 'same-origin' });
       const csrfBody = await csrfResponse.json() as { csrfToken?: string; error?: string };
+      if (csrfResponse.status === 401) throw new Error(SESSION_EXPIRED);
       if (!csrfResponse.ok || !csrfBody.csrfToken) throw new Error(csrfBody.error || 'Authentication unavailable');
       const response = await fetch('/api/admin/uploads', {
         method: 'DELETE',
@@ -265,6 +257,7 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
         body: JSON.stringify({ bucket: upload.bucket, key: upload.key }),
       });
       const body = await response.json() as { ok: boolean; error?: string };
+      if (response.status === 401) throw new Error(SESSION_EXPIRED);
       if (!response.ok || !body.ok) throw new Error(body.error || 'Delete failed');
       await refreshRecentUploads();
     } catch (error) {
@@ -336,22 +329,16 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
 
             <div className="space-y-7 p-5 sm:p-6">
               <ProductSelector
-                productLine={productLine}
+                businessLine={businessLine}
                 productId={productId}
-                productLines={productLines}
+                products={products}
                 filteredProducts={filteredProducts}
                 selectedProduct={selectedProduct}
-                onProductLineChange={changeProductLine}
+                onBusinessLineChange={changeBusinessLine}
                 onProductChange={setProductId}
               />
 
-              <FileDropzone
-                fileInputRef={fileInputRef}
-                dragActive={dragActive}
-                onDragActiveChange={setDragActive}
-                onDrop={handleDrop}
-                onFiles={addFiles}
-              />
+              <FileDropzone onFiles={addFiles} />
 
               {notice && (
                 <div role="alert" className="flex gap-3 border border-[color:var(--color-danger)]/50 bg-[color:var(--color-danger)]/10 p-4 text-sm text-[color:var(--color-danger)]">

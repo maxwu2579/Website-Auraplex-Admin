@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server';
-import { UPLOAD_BUCKETS, uploadMediaForExtension, type DeleteUploadResponse, type UploadBucket } from '@/lib/admin/upload-contract';
+import { UPLOAD_BUCKETS, uploadMediaForExtension, type DeleteUploadResponse, type UploadBucket, type UploadObjectLocation } from '@/lib/admin/upload-contract';
 import { UploadContractError, normalizeUploadError } from '@/lib/admin/upload-errors';
-import { parseProductLine, sanitizeUploadFilename } from '@/lib/admin/upload-validation';
-import { authenticateDeleteRequest, requireAdminPermission, type AdminIdentity } from '@/lib/admin/server/authorization';
+import { sanitizeUploadFilename } from '@/lib/admin/upload-validation';
+import { parseUploadObjectKey } from '@/lib/admin/object-key';
+import { toQdrantSourceKey } from '@/lib/admin/source-key';
+import { currentRequestIdentity, requireAdminPermission, type AdminIdentity } from '@/lib/admin/server/authorization';
 import { jsonAuditLogger, requestIp, type AuditLogger } from '@/lib/admin/server/audit';
 import { doubleSubmitCsrfValidator, type CsrfValidator } from '@/lib/admin/server/csrf';
 import { createStorageAdapter, type StorageAdapter } from '@/lib/admin/server/storage';
@@ -12,7 +14,8 @@ const MAX_DELETE_BODY_BYTES = 2_048;
 const DELETE_BODY_TIMEOUT_MS = 3_000;
 
 export interface DeleteDependencies {
-  authenticate: () => Promise<AdminIdentity>;
+  /** Resolves the session identity (null when absent or expired). */
+  authenticate: () => Promise<AdminIdentity | null>;
   csrf: CsrfValidator;
   storage: () => StorageAdapter;
   qdrant: () => QdrantEvidenceAdapter;
@@ -20,14 +23,20 @@ export interface DeleteDependencies {
 }
 
 const defaults: DeleteDependencies = {
-  authenticate: authenticateDeleteRequest,
+  authenticate: currentRequestIdentity,
   csrf: doubleSubmitCsrfValidator,
   storage: createStorageAdapter,
   qdrant: createQdrantAdapter,
   audit: jsonAuditLogger,
 };
 
-export function validateDeleteTarget(input: unknown): { bucket: UploadBucket; key: string; sourceKey: string } {
+/**
+ * Validates a stored object location against the ingest taxonomy
+ * (`machines|software|consulting/{slug}/{file}`). It deliberately does not
+ * consult today's website catalogue: an already-stored valid object remains
+ * deletable after its product is removed from the catalogue.
+ */
+export function validateDeleteTarget(input: unknown): UploadObjectLocation {
   if (!input || typeof input !== 'object') {
     throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Invalid delete target');
   }
@@ -35,19 +44,17 @@ export function validateDeleteTarget(input: unknown): { bucket: UploadBucket; ke
   if (typeof bucket !== 'string' || !UPLOAD_BUCKETS.includes(bucket as UploadBucket) || typeof key !== 'string') {
     throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Invalid delete target');
   }
-  const match = /^([a-z]+)\/([a-z0-9]+(?:-[a-z0-9]+)*)\/([a-z0-9][a-z0-9._-]*)$/.exec(key);
-  if (!match) throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Invalid object key');
-  const [, productLine, , filename] = match;
-  parseProductLine(productLine);
-  if (sanitizeUploadFilename(filename) !== filename) {
+  const { safeFilename } = parseUploadObjectKey(key);
+  if (sanitizeUploadFilename(safeFilename) !== safeFilename) {
     throw new UploadContractError(400, 'INVALID_FILENAME', 'Invalid object filename');
   }
-  const extension = filename.split('.').pop() ?? '';
+  const extension = safeFilename.split('.').pop() ?? '';
   const media = uploadMediaForExtension(extension);
   if (!media || media.bucket !== bucket) {
     throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Object type does not match bucket');
   }
-  return { bucket: bucket as UploadBucket, key, sourceKey: key };
+  const location = { bucket: bucket as UploadBucket, key };
+  return { ...location, sourceKey: toQdrantSourceKey(location) };
 }
 
 export async function readDeleteBody(request: Request, timeoutMs = DELETE_BODY_TIMEOUT_MS): Promise<unknown> {
@@ -96,8 +103,9 @@ export async function readDeleteBody(request: Request, timeoutMs = DELETE_BODY_T
 
 export async function deleteUpload(
   request: Request,
-  dependencies: DeleteDependencies = defaults,
+  overrides: Partial<DeleteDependencies> = {},
 ): Promise<Response> {
+  const dependencies: DeleteDependencies = { ...defaults, ...overrides };
   let identity: AdminIdentity | null = null;
   let key = 'unresolved';
   let qdrantDeleted = false;

@@ -15,45 +15,69 @@ import { getServerUploadMaxBytes } from '../lib/admin/server/upload-limit';
 import { UploadContractError } from '../lib/admin/upload-errors';
 import { toQdrantSourceKey } from '../lib/admin/source-key';
 import {
+  createQdrantAdapter,
+  qdrantCollectionForSourceKey,
+  QDRANT_COLLECTIONS,
   QdrantRestEvidenceAdapter,
   type QdrantEvidenceAdapter,
 } from '../lib/admin/server/qdrant';
+import { getQdrantConfig, tryGetQdrantConfig } from '../lib/admin/server/config';
+import { InMemoryUploadRateLimiter } from '../lib/admin/server/rate-limit';
 import { createStorageAdapter, S3StorageAdapter, type StorageAdapter } from '../lib/admin/server/storage';
 import {
   getUploads,
   putUpload,
   type UploadServiceDependencies,
 } from '../lib/admin/server/upload-service';
-import { deriveUploadStatus } from '../lib/admin/server/status';
-import { deleteUpload, readDeleteBody, type DeleteDependencies } from '../lib/admin/server/delete-service';
+import { buildRecentUpload, deriveUploadStatus } from '../lib/admin/server/status';
+import { deleteUpload, readDeleteBody, validateDeleteTarget, type DeleteDependencies } from '../lib/admin/server/delete-service';
 import { UPLOAD_METADATA } from '../lib/admin/server/object-metadata';
 import { canRetryUpload, queueStatusAfterResponse } from '../lib/admin/upload-ui-state';
 
 const PDF_BYTES = new TextEncoder().encode('%PDF-1.7\ncomplete-pdf-body');
 
 function uploadRequest(
-  contentLength = PDF_BYTES.byteLength,
+  contentLength: number | null = PDF_BYTES.byteLength,
   body: Uint8Array = PDF_BYTES,
 ) {
+  const headers: Record<string, string> = {
+    'content-type': 'application/pdf',
+    cookie: 'auraplex-admin-csrf=test-csrf',
+    'x-csrf-token': 'test-csrf',
+    'x-product-id': '6470625',
+    'x-product-line': 'labelling',
+    'x-upload-filename': encodeURIComponent('Product Manual.pdf'),
+  };
+  // null models a chunked request that carries no Content-Length.
+  if (contentLength !== null) headers['content-length'] = String(contentLength);
   return new NextRequest('http://localhost/api/admin/uploads', {
     method: 'PUT',
     body: body.slice().buffer as ArrayBuffer,
-    headers: {
-      'content-length': String(contentLength),
-      'content-type': 'application/pdf',
-      cookie: 'auraplex-admin-csrf=test-csrf',
-      'x-csrf-token': 'test-csrf',
-      'x-product-id': '6470625',
-      'x-product-line': 'labelling',
-      'x-upload-filename': encodeURIComponent('Product Manual.pdf'),
-    },
+    headers,
   });
 }
+
+function drainingStorage(onPut?: (input: Parameters<StorageAdapter['putObject']>[0], bytes: number) => void): StorageAdapter {
+  return {
+    async putObject(input) {
+      let bytes = 0;
+      for await (const chunk of input.body) bytes += Buffer.byteLength(chunk as Uint8Array);
+      onPut?.(input, bytes);
+      return {};
+    },
+    async listObjects() { return []; },
+    async deleteObject() {},
+  };
+}
+
+const unlimitedRateLimiter = {
+  admit: () => ({ allowanceBytes: Number.MAX_SAFE_INTEGER, settle() {} }),
+};
 
 function dependencies(
   storage: StorageAdapter,
   overrides: Partial<UploadServiceDependencies> = {},
-): UploadServiceDependencies {
+): Partial<UploadServiceDependencies> {
   return {
     authenticate: async () => ({
       userId: 'user-1',
@@ -61,7 +85,7 @@ function dependencies(
       groups: ['auraplex-uploader'],
     }),
     csrf: { verify() {} },
-    rateLimiter: { consume() {} },
+    rateLimiter: unlimitedRateLimiter,
     audit: { write() {} },
     storage: () => storage,
     qdrant: () => null,
@@ -93,7 +117,8 @@ test('streams request bytes through the limiter and maps MinIO input', async () 
   assert.equal(body.ok, true);
   assert.equal(receivedBytes, PDF_BYTES.byteLength);
   assert.equal(captured?.bucket, 'auraplex-raw-pdf');
-  assert.equal(captured?.key, 'labelling/flexy-applicator/product-manual.pdf');
+  assert.equal(captured?.key, 'machines/flexy-applicator/product-manual.pdf');
+  assert.equal(captured?.contentLength, PDF_BYTES.byteLength);
   assert.equal(captured?.metadata['product-line'], 'labelling');
   assert.equal(captured?.metadata['product-id'], '6470625');
   assert.equal(captured?.metadata['safe-filename'], 'product-manual.pdf');
@@ -101,7 +126,111 @@ test('streams request bytes through the limiter and maps MinIO input', async () 
   assert.equal(captured?.metadata['uploaded-by'], 'user-1');
   if (body.ok) {
     assert.equal(body.status, 'pending');
-    assert.equal(body.sourceKey, 'labelling/flexy-applicator/product-manual.pdf');
+    assert.equal(body.key, 'machines/flexy-applicator/product-manual.pdf');
+    assert.equal(body.sourceKey, 'auraplex-raw-pdf/machines/flexy-applicator/product-manual.pdf');
+    assert.equal(body.size, PDF_BYTES.byteLength);
+  }
+});
+
+test('missing Content-Length is accepted and actual bytes are authoritative', async () => {
+  const audits: Array<{ action: string; size: number }> = [];
+  const admissions: Array<number | undefined> = [];
+  const settled: number[] = [];
+  let stored: { contentLength?: number; bytes: number } | undefined;
+  const body = new Uint8Array(9_000);
+  body.set(PDF_BYTES, 0);
+  const response = await putUpload(uploadRequest(null, body), dependencies(
+    drainingStorage((input, bytes) => { stored = { contentLength: input.contentLength, bytes }; }),
+    {
+      audit: { write(event) { audits.push(event); } },
+      rateLimiter: {
+        admit(_user, request) {
+          admissions.push(request.declaredBytes);
+          return { allowanceBytes: request.maxUploadBytes, settle(bytes) { settled.push(bytes); } };
+        },
+      },
+    },
+  ));
+  const json = await response.json();
+  assert.equal(response.status, 200);
+  assert.equal(json.size, 9_000);
+  assert.deepEqual(stored, { contentLength: undefined, bytes: 9_000 });
+  assert.deepEqual(admissions, [undefined]);
+  assert.deepEqual(settled, [9_000]);
+  assert.deepEqual(audits.map(({ action, size }) => ({ action, size })), [{ action: 'upload.accepted', size: 9_000 }]);
+});
+
+test('missing Content-Length with a zero-byte body fails as EMPTY_FILE', async () => {
+  let stored = false;
+  const response = await putUpload(uploadRequest(null, new Uint8Array(0)), dependencies(
+    drainingStorage(() => { stored = true; }),
+  ));
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).code, 'EMPTY_FILE');
+  assert.equal(stored, false);
+});
+
+test('missing Content-Length with a stream above the runtime limit returns 413', async () => {
+  const previous = process.env.ADMIN_UPLOAD_MAX_MB;
+  process.env.ADMIN_UPLOAD_MAX_MB = '1';
+  try {
+    const body = new Uint8Array(1024 * 1024 + 1);
+    body.set(PDF_BYTES, 0);
+    const audits: number[] = [];
+    const response = await putUpload(uploadRequest(null, body), dependencies(drainingStorage(), {
+      audit: { write(event) { audits.push(event.size); } },
+    }));
+    assert.equal(response.status, 413);
+    assert.equal((await response.json()).code, 'FILE_TOO_LARGE');
+    assert.ok(audits[0] > 1024 * 1024, 'audit records the bytes actually received');
+  } finally {
+    if (previous === undefined) delete process.env.ADMIN_UPLOAD_MAX_MB;
+    else process.env.ADMIN_UPLOAD_MAX_MB = previous;
+  }
+});
+
+test('invalid Content-Length is rejected before storage', async () => {
+  let stored = false;
+  const request = new NextRequest('http://localhost/api/admin/uploads', {
+    method: 'PUT',
+    body: PDF_BYTES.slice().buffer as ArrayBuffer,
+    headers: {
+      'content-length': 'not-a-number', 'content-type': 'application/pdf',
+      'x-csrf-token': 'test', 'x-product-id': '6470625', 'x-product-line': 'labelling',
+      'x-upload-filename': 'manual.pdf',
+    },
+  });
+  const response = await putUpload(request, dependencies(drainingStorage(() => { stored = true; })));
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).code, 'INVALID_CONTENT_LENGTH');
+  assert.equal(stored, false);
+});
+
+test('unknown-length uploads settle real bytes against the hourly volume', async () => {
+  const limiter = new InMemoryUploadRateLimiter();
+  const body = new Uint8Array(5_000);
+  body.set(PDF_BYTES, 0);
+  const response = await putUpload(uploadRequest(null, body), dependencies(drainingStorage(), { rateLimiter: limiter }));
+  assert.equal(response.status, 200);
+  const events = (limiter as unknown as { events: Map<string, Array<{ bytes: number }>> }).events.get('user-1');
+  assert.deepEqual(events?.map((event) => event.bytes), [5_000]);
+});
+
+test('software and consulting uploads are refused until real products exist', async () => {
+  for (const line of ['software', 'consulting']) {
+    let stored = false;
+    const request = new NextRequest('http://localhost/api/admin/uploads', {
+      method: 'PUT',
+      body: PDF_BYTES.slice().buffer as ArrayBuffer,
+      headers: {
+        'content-type': 'application/pdf', 'x-csrf-token': 'test', 'x-product-id': '6470625',
+        'x-product-line': line, 'x-upload-filename': 'manual.pdf',
+      },
+    });
+    const response = await putUpload(request, dependencies(drainingStorage(() => { stored = true; })));
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).code, 'INVALID_PRODUCT');
+    assert.equal(stored, false);
   }
 });
 
@@ -275,39 +404,45 @@ test('rejects oversized declarations before opening storage', async () => {
 
 test('S3 adapter sends a PutObjectCommand with the supplied stream metadata', async () => {
   let command: unknown;
-  let passedSignal: AbortSignal | undefined;
+  let sent!: () => void;
+  const sending = new Promise<void>((resolve) => { sent = resolve; });
   const adapter = new S3StorageAdapter({
-    send: async (value: unknown, options?: { abortSignal?: AbortSignal }) => {
+    send: (value: unknown, options?: { abortSignal?: AbortSignal }) => {
       command = value;
-      passedSignal = options?.abortSignal;
-      return { ETag: 'etag' };
+      sent();
+      // Stays in flight until cancelled, like a slow upstream.
+      return new Promise((_resolve, reject) => {
+        options?.abortSignal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
     },
   } as never);
   const controller = new AbortController();
-  await adapter.putObject({
+  const pending = adapter.putObject({
     bucket: 'auraplex-raw-pdf',
-    key: 'labelling/product/manual.pdf',
+    key: 'machines/product/manual.pdf',
     body: Readable.from([Buffer.from('pdf')]),
     contentLength: 3,
     contentType: 'application/pdf',
     metadata: { 'product-id': '123' },
     signal: controller.signal,
   });
+  await sending;
   assert.ok(command instanceof PutObjectCommand);
   assert.equal(command.input.Bucket, 'auraplex-raw-pdf');
-  assert.equal(command.input.Key, 'labelling/product/manual.pdf');
+  assert.equal(command.input.Key, 'machines/product/manual.pdf');
+  assert.equal(command.input.ContentLength, 3);
   assert.equal(command.input.Metadata?.['product-id'], '123');
-  assert.equal(passedSignal, controller.signal);
+  // Request cancellation reaches the in-flight SDK call.
   controller.abort();
-  assert.equal(passedSignal.aborted, true);
+  await assert.rejects(pending, /aborted/);
 });
 
 test('S3 adapter sends a DeleteObjectCommand for the exact bucket and key', async () => {
   let command: unknown;
   const adapter = new S3StorageAdapter({ send: async (value: unknown) => { command = value; return {}; } } as never);
-  await adapter.deleteObject('auraplex-raw-pdf', 'labelling/flexy-applicator/manual.pdf');
+  await adapter.deleteObject('auraplex-raw-pdf', 'machines/flexy-applicator/manual.pdf');
   assert.ok(command instanceof DeleteObjectCommand);
-  assert.equal(command.input.Key, 'labelling/flexy-applicator/manual.pdf');
+  assert.equal(command.input.Key, 'machines/flexy-applicator/manual.pdf');
 });
 
 test('MinIO client keeps path-style addressing enabled', () => {
@@ -349,9 +484,39 @@ test('S3 listing follows continuation tokens and returns newest objects first', 
       return { Metadata: { 'uploaded-by': 'user-1' } };
     },
   } as never);
-  const objects = await adapter.listObjects('auraplex-raw-pdf', 2);
+  const objects = await adapter.listObjects('auraplex-raw-pdf', { limit: 2 });
   assert.deepEqual(listTokens, [undefined, 'next-page']);
   assert.deepEqual(objects.map((object) => object.key), ['newer.pdf', 'older.pdf']);
+});
+
+test('uploader items are not lost behind a global latest-50 slice of other users', async () => {
+  const base = Date.parse('2026-09-01T00:00:00Z');
+  const contents = [
+    { Key: 'machines/p/own-old.pdf', Size: 1, LastModified: new Date(base) },
+    ...Array.from({ length: 120 }, (_, index) => ({
+      Key: `machines/p/other-${index}.pdf`, Size: 1, LastModified: new Date(base + (index + 1) * 1000),
+    })),
+  ];
+  let heads = 0;
+  const adapter = new S3StorageAdapter({
+    send: async (command: unknown) => {
+      if (command instanceof ListObjectsV2Command) {
+        return { IsTruncated: false, Contents: command.input.Bucket === 'auraplex-raw-pdf' ? contents : [] };
+      }
+      assert.ok(command instanceof HeadObjectCommand);
+      heads += 1;
+      const own = command.input.Key === 'machines/p/own-old.pdf';
+      return { Metadata: { 'uploaded-by': own ? 'user-1' : 'user-2' } };
+    },
+  } as never);
+  const response = await getUploads(
+    new Request('http://localhost/api/admin/uploads'),
+    dependencies(adapter),
+  );
+  const body = await response.json();
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.uploads.map((item: { key: string }) => item.key), ['machines/p/own-old.pdf']);
+  assert.ok(heads <= contents.length, 'HEAD requests stay bounded by the listing');
 });
 
 test('status mapping never treats missing Qdrant evidence as failed', () => {
@@ -362,20 +527,23 @@ test('status mapping never treats missing Qdrant evidence as failed', () => {
   assert.equal(deriveUploadStatus({ stored: true, processedEvidence: false }), 'unsupported');
 });
 
-test('Qdrant adapter filters by the isolated relative source key', async () => {
+test('Qdrant adapter filters by the bucket/key source key', async () => {
   let filterValue: unknown;
+  let collection = '';
   const qdrant = new QdrantRestEvidenceAdapter({
-    async scroll(_collection: string, options: { filter?: { must?: Array<{ match?: { value?: unknown } }> } }) {
+    async scroll(name: string, options: { filter?: { must?: Array<{ match?: { value?: unknown } }> } }) {
+      collection = name;
       filterValue = options.filter?.must?.[0]?.match?.value;
       return { points: [{ id: 1 }], next_page_offset: null };
     },
-  } as never, 'uploads');
+  } as never);
   const sourceKey = toQdrantSourceKey({
     bucket: 'auraplex-raw-pdf',
-    key: 'labelling/flexy-applicator/manual.pdf',
+    key: 'machines/flexy-applicator/manual.pdf',
   });
   assert.equal(await qdrant.hasProcessedEvidence(sourceKey), true);
-  assert.equal(filterValue, 'labelling/flexy-applicator/manual.pdf');
+  assert.equal(filterValue, 'auraplex-raw-pdf/machines/flexy-applicator/manual.pdf');
+  assert.equal(collection, 'auraplex_machines');
 });
 
 test('Qdrant deletion waits for exact source-key filter completion', async () => {
@@ -387,24 +555,87 @@ test('Qdrant deletion waits for exact source-key filter completion', async () =>
       options = input;
       return { status: 'completed' };
     },
-  } as never, 'uploads');
-  await qdrant.deleteBySourceKey('labelling/flexy-applicator/manual.pdf');
-  assert.equal(collection, 'uploads');
+  } as never);
+  await qdrant.deleteBySourceKey('auraplex-raw-pdf/software/some-product/manual.pdf');
+  assert.equal(collection, 'auraplex_software');
   assert.deepEqual(options, {
-    filter: { must: [{ key: 'source_key', match: { value: 'labelling/flexy-applicator/manual.pdf' } }] },
+    filter: { must: [{ key: 'source_key', match: { value: 'auraplex-raw-pdf/software/some-product/manual.pdf' } }] },
     wait: true,
   });
 });
 
-test('Qdrant collection selection is isolated behind a source-key resolver', async () => {
+test('Qdrant routes each ingest line to its confirmed collection', () => {
+  assert.deepEqual({ ...QDRANT_COLLECTIONS }, {
+    machines: 'auraplex_machines',
+    software: 'auraplex_software',
+    consulting: 'auraplex_consulting',
+  });
+  assert.equal(qdrantCollectionForSourceKey('auraplex-raw-pdf/machines/p/manual.pdf'), 'auraplex_machines');
+  assert.equal(qdrantCollectionForSourceKey('auraplex-raw-image/software/p/diagram.png'), 'auraplex_software');
+  assert.equal(qdrantCollectionForSourceKey('auraplex-raw-video/consulting/p/demo.mp4'), 'auraplex_consulting');
+});
+
+test('Qdrant routing fails explicitly for unknown and legacy prefixes', async () => {
+  let called = false;
+  const qdrant = new QdrantRestEvidenceAdapter({
+    async scroll() { called = true; return { points: [] }; },
+    async delete() { called = true; return { status: 'completed' }; },
+  } as never);
+  for (const sourceKey of [
+    'auraplex-raw-pdf/labelling/flexy-applicator/manual.pdf',
+    'auraplex-raw-pdf/unknown/p/manual.pdf',
+    'machines/p/manual.pdf',
+  ]) {
+    assert.throws(() => qdrantCollectionForSourceKey(sourceKey), UploadContractError);
+    await assert.rejects(qdrant.hasProcessedEvidence(sourceKey), UploadContractError);
+    await assert.rejects(qdrant.deleteBySourceKey(sourceKey), UploadContractError);
+  }
+  assert.equal(called, false, 'no collection is queried or scanned as a fallback');
+});
+
+test('status and delete share one collection resolver', async () => {
   const seen: string[] = [];
   const qdrant = new QdrantRestEvidenceAdapter({
-    async scroll(name: string) { seen.push(name); return { points: [], next_page_offset: null }; },
-    async delete(name: string) { seen.push(name); return { status: 'completed' }; },
-  } as never, (sourceKey) => sourceKey.startsWith('line-a/') ? 'collection-a' : 'collection-b');
-  await qdrant.hasProcessedEvidence('line-a/product/manual.pdf');
-  await qdrant.deleteBySourceKey('line-b/product/manual.pdf');
-  assert.deepEqual(seen, ['collection-a', 'collection-b']);
+    async scroll(name: string) { seen.push(`status:${name}`); return { points: [] }; },
+    async delete(name: string) { seen.push(`delete:${name}`); return { status: 'completed' }; },
+  } as never);
+  for (const line of ['machines', 'software', 'consulting']) {
+    const sourceKey = `auraplex-raw-pdf/${line}/p/manual.pdf`;
+    await qdrant.hasProcessedEvidence(sourceKey);
+    await qdrant.deleteBySourceKey(sourceKey);
+  }
+  assert.deepEqual(seen, [
+    'status:auraplex_machines', 'delete:auraplex_machines',
+    'status:auraplex_software', 'delete:auraplex_software',
+    'status:auraplex_consulting', 'delete:auraplex_consulting',
+  ]);
+  const factoryAdapter = createQdrantAdapter({ url: 'http://qdrant.example.test:6333' });
+  assert.equal(
+    (factoryAdapter as unknown as { collectionForSourceKey: unknown }).collectionForSourceKey,
+    qdrantCollectionForSourceKey,
+  );
+});
+
+test('Qdrant configuration no longer uses QDRANT_COLLECTION', () => {
+  assert.deepEqual(getQdrantConfig({ QDRANT_URL: 'http://qdrant.example.test:6333' } as unknown as NodeJS.ProcessEnv), {
+    url: 'http://qdrant.example.test:6333',
+    apiKey: undefined,
+  });
+  assert.equal(tryGetQdrantConfig({ QDRANT_COLLECTION: 'legacy' } as unknown as NodeJS.ProcessEnv), null);
+});
+
+test('status reports legacy-prefix objects as unsupported without querying Qdrant', async () => {
+  let queried = false;
+  const upload = await buildRecentUpload({
+    bucket: 'auraplex-raw-pdf',
+    key: 'labelling/flexy-applicator/manual.pdf',
+    size: 1,
+    lastModified: null,
+    metadata: {},
+  }, { async hasProcessedEvidence() { queried = true; return true; }, async deleteBySourceKey() {} });
+  assert.equal(upload.status, 'unsupported');
+  assert.equal(upload.sourceKey, 'auraplex-raw-pdf/labelling/flexy-applicator/manual.pdf');
+  assert.equal(queried, false);
 });
 
 test('GET status gives uploaders own objects only and admins all objects', async () => {
@@ -416,21 +647,21 @@ test('GET status gives uploaders own objects only and admins all objects', async
         ? [
             {
               bucket,
-              key: 'labelling/flexy-applicator/own.pdf',
+              key: 'machines/flexy-applicator/own.pdf',
               size: 10,
               lastModified: new Date('2026-09-21T10:00:00Z'),
               metadata: { 'upload-id': 'own-id', 'uploaded-by': 'user-1' },
             },
             {
               bucket,
-              key: 'labelling/flexy-applicator/other.pdf',
+              key: 'machines/flexy-applicator/other.pdf',
               size: 10,
               lastModified: new Date('2026-09-21T11:00:00Z'),
               metadata: { 'upload-id': 'other-id', 'uploaded-by': 'user-2' },
             },
             {
               bucket,
-              key: 'labelling/flexy-applicator/legacy.pdf',
+              key: 'machines/flexy-applicator/legacy.pdf',
               size: 10,
               lastModified: new Date('2026-09-21T12:00:00Z'),
               metadata: { 'upload-id': 'legacy-id' } as Record<string, string>,
@@ -477,15 +708,16 @@ test('frontend response mapping never treats a 503 error body as uploaded', () =
     ok: true,
     uploadId: '1',
     bucket: 'auraplex-raw-pdf',
-    key: 'a/b.pdf',
-    sourceKey: 'a/b.pdf',
+    key: 'machines/b/c.pdf',
+    sourceKey: 'auraplex-raw-pdf/machines/b/c.pdf',
+    size: 1,
     status: 'pending',
   }), 'uploaded');
   assert.equal(canRetryUpload('failed'), true);
   assert.equal(canRetryUpload('uploaded'), false);
 });
 
-function deleteRequest(key = 'labelling/flexy-applicator/manual.pdf') {
+function deleteRequest(key = 'machines/flexy-applicator/manual.pdf') {
   return new Request('http://localhost/api/admin/uploads', {
     method: 'DELETE',
     headers: { 'content-type': 'application/json' },
@@ -510,13 +742,43 @@ function deleteDependencies(overrides: Partial<DeleteDependencies> = {}): Delete
 
 test('Admin delete removes exact Qdrant source before the MinIO object', async () => {
   const calls: string[] = [];
-  const target = 'labelling/flexy-applicator/manual.pdf';
+  const target = 'machines/flexy-applicator/manual.pdf';
   const response = await deleteUpload(deleteRequest(target), deleteDependencies({
     qdrant: () => ({ async hasProcessedEvidence() { return false; }, async deleteBySourceKey(key) { calls.push(`qdrant:${key}`); } }),
     storage: () => ({ async putObject() { return {}; }, async listObjects() { return []; }, async deleteObject(bucket, key) { calls.push(`minio:${bucket}/${key}`); } }),
   }));
   assert.equal(response.status, 200);
-  assert.deepEqual(calls, [`qdrant:${target}`, `minio:auraplex-raw-pdf/${target}`]);
+  // source_key includes the bucket; MinIO receives the bare key.
+  assert.deepEqual(calls, [`qdrant:auraplex-raw-pdf/${target}`, `minio:auraplex-raw-pdf/${target}`]);
+  assert.equal((await response.json()).sourceKey, `auraplex-raw-pdf/${target}`);
+});
+
+test('delete validation accepts every ingest prefix without consulting the catalogue', () => {
+  for (const [bucket, key] of [
+    ['auraplex-raw-pdf', 'machines/flexy-applicator/manual.pdf'],
+    ['auraplex-raw-image', 'software/future-product/diagram.png'],
+    ['auraplex-raw-video', 'consulting/future-service/demo.mp4'],
+    // Product removed from today's catalogue: the stored object stays deletable.
+    ['auraplex-raw-pdf', 'machines/discontinued-machine/manual.pdf'],
+  ] as const) {
+    assert.deepEqual(validateDeleteTarget({ bucket, key }), { bucket, key, sourceKey: `${bucket}/${key}` });
+  }
+});
+
+test('delete rejects legacy and unknown prefixes before external operations', async () => {
+  for (const key of [
+    'labelling/flexy-applicator/manual.pdf',
+    'unknown/flexy-applicator/manual.pdf',
+    'machines/flexy-applicator/nested/manual.pdf',
+  ]) {
+    let used = false;
+    const response = await deleteUpload(deleteRequest(key), deleteDependencies({
+      qdrant: () => { used = true; throw new Error('must not open Qdrant'); },
+      storage: () => { used = true; throw new Error('must not open storage'); },
+    }));
+    assert.equal(response.status, 400, key);
+    assert.equal(used, false);
+  }
 });
 
 test('delete body parsing times out a stalled stream', async () => {

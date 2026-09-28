@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server';
 import { normalizeUploadError } from '@/lib/admin/upload-errors';
-import { authenticateAdminRequest, requireUploadPermission, type AdminIdentity } from '@/lib/admin/server/authorization';
+import { currentRequestIdentity, requireUploadPermission, type AdminIdentity } from '@/lib/admin/server/authorization';
 import { ADMIN_CSRF_COOKIE, adminCsrfCookieOptions, issueCsrfToken } from '@/lib/admin/server/csrf';
 
 export async function getAdminCsrfResponse(
-  authenticate: () => Promise<AdminIdentity> = authenticateAdminRequest,
+  authenticate: () => Promise<AdminIdentity | null> = currentRequestIdentity,
 ): Promise<Response> {
   try {
     requireUploadPermission(await authenticate());

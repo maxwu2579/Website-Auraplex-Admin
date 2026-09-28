@@ -1,9 +1,8 @@
 import createMiddleware from 'next-intl/middleware';
-import { getToken } from 'next-auth/jwt';
 import { NextRequest, NextResponse } from 'next/server';
 import { routing } from './lib/navigation';
-import { authSessionCookieName } from './lib/admin/server/auth-cookies';
-import { canUpload } from './lib/admin/server/authorization';
+import { canUpload, identityFromSession } from './lib/admin/server/authorization';
+import { appendSetCookies, loadAdminSession, type AdminSessionLoader } from './lib/admin/server/session';
 
 const localeProxy = createMiddleware(routing);
 
@@ -20,23 +19,10 @@ export function adminGuardStatus(groups: unknown): 200 | 401 | 403 {
   }) ? 200 : 403;
 }
 
-export default async function proxy(request: NextRequest) {
+function adminGuardResponse(request: NextRequest, status: 200 | 401 | 403): NextResponse {
   const pathname = request.nextUrl.pathname;
-  if (!isProtectedAdminPath(pathname)) return localeProxy(request);
-
-  const isApi = pathname === '/api/admin' || pathname.startsWith('/api/admin/');
-  const secret = process.env.AUTH_SECRET;
-  if (!secret) {
-    return new NextResponse('Authentication is not configured', { status: 503 });
-  }
-  const token = await getToken({
-    req: request,
-    secret,
-    cookieName: authSessionCookieName(process.env.NODE_ENV === 'production'),
-  });
-  const status = token ? adminGuardStatus(token.groups) : 401;
   if (status === 200) return NextResponse.next();
-  if (isApi) {
+  if (pathname === '/api/admin' || pathname.startsWith('/api/admin/')) {
     return NextResponse.json(
       { ok: false, code: status === 401 ? 'UNAUTHENTICATED' : 'FORBIDDEN', error: 'Access denied' },
       { status, headers: { 'Cache-Control': 'no-store' } },
@@ -48,7 +34,45 @@ export default async function proxy(request: NextRequest) {
   return NextResponse.redirect(login);
 }
 
+/**
+ * Admin gate. Sessions are read through Auth.js (loadAdminSession), so the
+ * 30-minute idle and 12-hour absolute limits are the exact rules the route
+ * handlers apply. The re-issued cookie (activity) or its removal (expiry) is
+ * attached to every admin response, including redirects and 401s.
+ */
+export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSession) {
+  return async function proxy(request: NextRequest) {
+    const pathname = request.nextUrl.pathname;
+    if (!isProtectedAdminPath(pathname)) return localeProxy(request);
+
+    if (!process.env.AUTH_SECRET) {
+      return new NextResponse('Authentication is not configured', { status: 503 });
+    }
+    const { session, setCookies } = await loadSession(request.headers);
+    const identity = identityFromSession(session);
+    const status = identity ? adminGuardStatus(identity.groups) : 401;
+    return appendSetCookies(adminGuardResponse(request, status), setCookies);
+  };
+}
+
+export default createAdminProxy();
+
+/**
+ * Streaming upload endpoint that must never run through Proxy. When Proxy runs,
+ * Next.js tees the request body into an in-memory clone capped by
+ * `proxyClientMaxBodySize` (10 MiB) and truncates the Route Handler's copy at
+ * that cap. Its handlers (PUT/GET/DELETE) authenticate the session, enforce
+ * Keycloak groups, CSRF, rate limits and validation themselves.
+ */
+export const PROXY_BYPASS_UPLOAD_PATH = '/api/admin/uploads';
+
 export const config = {
-  // Public i18n plus explicit admin pages/APIs. Auth.js itself is excluded.
-  matcher: ['/((?!api|_next|_vercel|studio|admin|.*\\..*).*)', '/admin/:path*', '/api/admin/:path*'],
+  // Public i18n plus explicit admin pages/APIs. Auth.js itself is excluded,
+  // and so is PROXY_BYPASS_UPLOAD_PATH (see above).
+  matcher: [
+    '/((?!api|_next|_vercel|studio|admin|.*\\..*).*)',
+    '/admin/:path*',
+    '/api/admin',
+    '/api/admin/((?!uploads$).*)',
+  ],
 };

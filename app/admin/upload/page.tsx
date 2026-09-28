@@ -1,5 +1,5 @@
 import { UploadPanel } from '@/components/admin/upload-panel';
-import { MACHINES } from '@/lib/catalog';
+import { UPLOAD_PRODUCTS } from '@/lib/admin/upload-products';
 import { authenticateAdminRequest, canViewAllUploads } from '@/lib/admin/server/authorization';
 import { UploadContractError } from '@/lib/admin/upload-errors';
 import { getServerUploadMaxMb } from '@/lib/admin/server/upload-limit';
@@ -20,14 +20,7 @@ async function AuthorizedUploadPage() {
     if (error instanceof UploadContractError && error.status === 403) notFound();
     throw error;
   }
-  const products = MACHINES.map(({ id, name, slug, category }) => ({
-    id,
-    name,
-    slug,
-    category,
-  }));
-
-  return <UploadPanel products={products} canDelete={canDelete} serverMaxUploadMb={getServerUploadMaxMb()} />;
+  return <UploadPanel products={[...UPLOAD_PRODUCTS]} canDelete={canDelete} serverMaxUploadMb={getServerUploadMaxMb()} />;
 }
 
 export default function AdminUploadPage() {

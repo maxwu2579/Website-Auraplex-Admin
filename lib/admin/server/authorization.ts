@@ -83,18 +83,24 @@ export function identityFromSession(session: Session | null): AdminIdentity | nu
   };
 }
 
-export async function authenticateAdminRequest(): Promise<AdminIdentity> {
+/**
+ * Session identity for the current request (admin page, CSRF route). It uses
+ * the same Auth.js session read and 30-minute idle / 12-hour absolute policy
+ * as Proxy; Proxy has already persisted the refreshed cookie for these paths.
+ */
+export async function currentRequestIdentity(): Promise<AdminIdentity | null> {
   // Fail clearly before invoking Auth.js when local/production Keycloak values
   // are absent. This avoids pretending that SSO has been verified.
   getKeycloakConfig();
-  const { auth } = await import('@/auth');
-  return requireUploadPermission(identityFromSession(await auth()));
+  const [{ headers }, { loadAdminSession }] = await Promise.all([
+    import('next/headers'),
+    import('@/lib/admin/server/session'),
+  ]);
+  return identityFromSession((await loadAdminSession(await headers())).session);
 }
 
-export async function authenticateDeleteRequest(): Promise<AdminIdentity> {
-  getKeycloakConfig();
-  const { auth } = await import('@/auth');
-  return requireAdminPermission(identityFromSession(await auth()));
+export async function authenticateAdminRequest(): Promise<AdminIdentity> {
+  return requireUploadPermission(await currentRequestIdentity());
 }
 
 export function extractKeycloakGroups(profile: unknown): string[] {

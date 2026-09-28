@@ -1,17 +1,21 @@
-import { MACHINES, PRODUCT_CATEGORIES, type Category } from '@/lib/catalog';
 import {
   UPLOAD_HEADERS,
   UPLOAD_MEDIA_ROUTES,
-  type ProductLine,
   type UploadMediaRoute,
   type UploadObjectLocation,
   type UploadRequestMetadata,
 } from '@/lib/admin/upload-contract';
+import {
+  ingestLineForBusinessLine,
+  isBusinessLine,
+  type BusinessLine,
+  type IngestLine,
+} from '@/lib/admin/upload-domain';
 import { UploadContractError } from '@/lib/admin/upload-errors';
+import { buildUploadObjectKey } from '@/lib/admin/object-key';
 import { toQdrantSourceKey } from '@/lib/admin/source-key';
+import { findUploadProduct, hasUploadProducts, type UploadProduct } from '@/lib/admin/upload-products';
 import { getServerUploadMaxBytes } from '@/lib/admin/server/upload-limit';
-
-const PRODUCT_LINES = new Set<Category>(PRODUCT_CATEGORIES);
 
 function requiredHeader(headers: Headers, name: string): string {
   const value = headers.get(name)?.trim();
@@ -40,7 +44,7 @@ function decodeFilenameHeader(value: string): string {
 function sanitizeSegment(value: string, fallback?: string): string {
   const normalized = value
     .normalize('NFKD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[̀-ͯ]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9_-]+/g, '-')
     .replace(/[-_]{2,}/g, '-')
@@ -51,41 +55,37 @@ function sanitizeSegment(value: string, fallback?: string): string {
   throw new UploadContractError(400, 'INVALID_FILENAME', 'Filename is empty after sanitization');
 }
 
-export function parseProductLine(value: string): ProductLine {
-  if (!PRODUCT_LINES.has(value as Category)) {
+export function parseBusinessLine(value: string): BusinessLine {
+  if (!isBusinessLine(value)) {
     throw new UploadContractError(
       400,
       'MALFORMED_REQUEST',
-      'Product line is not valid',
+      'Business line is not valid',
     );
   }
-  return value as ProductLine;
+  return value;
 }
 
-export function resolveUploadProduct(productId: string, productLine: ProductLine) {
-  const product = MACHINES.find((machine) => machine.id === productId);
+export function resolveUploadProduct(productId: string, businessLine: BusinessLine): UploadProduct {
+  if (!hasUploadProducts(businessLine)) {
+    throw new UploadContractError(
+      400,
+      'INVALID_PRODUCT',
+      'No products are configured for this business line yet',
+    );
+  }
+  const product = findUploadProduct(productId);
   if (!product) {
     throw new UploadContractError(400, 'INVALID_PRODUCT', 'Product ID does not exist');
   }
-  if (product.category !== productLine) {
+  if (product.businessLine !== businessLine) {
     throw new UploadContractError(
       400,
       'PRODUCT_LINE_MISMATCH',
-      'Product does not belong to the selected product line',
+      'Product does not belong to the selected business line',
     );
   }
-  return {
-    id: product.id,
-    name: product.name,
-    slug: product.slug,
-    category: product.category,
-  };
-}
-
-// Routing boundary: this preserves the website's current category until the
-// ingest taxonomy and its product mapping are confirmed by the owner.
-export function resolveStorageProductLine(product: { category: Category }): ProductLine {
-  return product.category;
+  return product;
 }
 
 export function sanitizeUploadFilename(originalFilename: string): string {
@@ -128,20 +128,30 @@ export function sanitizeUploadFilename(originalFilename: string): string {
   return `${shortenedStem || 'file'}.${extension}`;
 }
 
-export function validateDeclaredSize(rawContentLength: string | null, maxBytes = getServerUploadMaxBytes()): number {
-  if (rawContentLength === null || rawContentLength.trim() === '') {
-    throw new UploadContractError(
-      400,
-      'MISSING_CONTENT_LENGTH',
-      'Content-Length is required',
-    );
-  }
+function fileTooLarge(maxBytes: number, prefix = 'File'): UploadContractError {
+  return new UploadContractError(
+    413,
+    'FILE_TOO_LARGE',
+    `${prefix} exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MB limit`,
+  );
+}
+
+/**
+ * Content-Length is optional (chunked uploads through proxies omit it). When
+ * present it must be a positive integer within the runtime limit; when absent
+ * the byte counter's actual total is authoritative.
+ */
+export function validateDeclaredSize(
+  rawContentLength: string | null,
+  maxBytes = getServerUploadMaxBytes(),
+): number | undefined {
+  if (rawContentLength === null || rawContentLength.trim() === '') return undefined;
 
   if (!/^\d+$/.test(rawContentLength.trim())) {
     throw new UploadContractError(
       400,
       'INVALID_CONTENT_LENGTH',
-      'Content-Length must be a non-negative integer',
+      'Content-Length must be a positive integer',
     );
   }
 
@@ -156,47 +166,106 @@ export function validateDeclaredSize(rawContentLength: string | null, maxBytes =
   if (size === 0) {
     throw new UploadContractError(400, 'EMPTY_FILE', 'Empty files are not accepted');
   }
-  if (size > maxBytes) {
-    throw new UploadContractError(
-      413,
-      'FILE_TOO_LARGE',
-      `File exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MB limit`,
-    );
-  }
+  if (size > maxBytes) throw fileTooLarge(maxBytes);
   return size;
 }
 
 /**
- * Counts the bytes that actually pass through an upload stream. This is kept
- * separate from the Content-Length preflight so the future MinIO adapter can
- * pipe the request body without buffering the whole file in Node.js memory.
+ * An upload fails with 408 when no bytes move through it for this long. It is
+ * a no-progress limit, not a total duration limit: a slow but steadily
+ * progressing 500 MB upload is never cut off. Node's HTTP server does not time
+ * out a stalled request body once Next.js has dispatched the handler, so this
+ * is what stops an abandoned-but-open connection from holding an upload slot.
  */
-export function createUploadByteLimitStream(
-  maxBytes: number = getServerUploadMaxBytes(),
-  expectedBytes?: number,
-): TransformStream<Uint8Array, Uint8Array> {
-  let receivedBytes = 0;
+export const UPLOAD_IDLE_TIMEOUT_MS = 120_000;
 
-  return new TransformStream<Uint8Array, Uint8Array>({
+export interface UploadByteCounterOptions {
+  /** Runtime per-file limit (413 when exceeded). */
+  maxBytes?: number;
+  /** Declared Content-Length, when present (400 SIZE_MISMATCH on mismatch). */
+  expectedBytes?: number;
+  /** Remaining hourly byte volume for this user (429 when exceeded). */
+  volumeAllowanceBytes?: number;
+  /** No-progress limit (408); defaults to UPLOAD_IDLE_TIMEOUT_MS, 0 disables. */
+  idleTimeoutMs?: number;
+}
+
+export interface UploadByteCounter {
+  readonly stream: TransformStream<Uint8Array, Uint8Array>;
+  /** Bytes that actually passed through the stream so far. */
+  readonly receivedBytes: number;
+  /** Clears the idle timer; call once the upload has settled either way. */
+  stop(): void;
+}
+
+/**
+ * Counts the bytes that actually pass through an upload stream without
+ * buffering them. The final count is authoritative for storage, rate-limit
+ * volume and audit, whether or not Content-Length was sent.
+ *
+ * The idle timer restarts whenever a chunk passes. Chunks pass only when the
+ * storage side pulls, so a stall on either side (silent client, or MinIO no
+ * longer accepting parts) counts as no progress and errors the stream, which
+ * aborts the storage request through the existing body-failure path.
+ */
+export function createUploadByteCounter(
+  options: UploadByteCounterOptions = {},
+): UploadByteCounter {
+  const maxBytes = options.maxBytes ?? getServerUploadMaxBytes();
+  const { expectedBytes, volumeAllowanceBytes } = options;
+  const idleTimeoutMs = options.idleTimeoutMs ?? UPLOAD_IDLE_TIMEOUT_MS;
+  let receivedBytes = 0;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const stopIdleTimer = () => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer);
+    idleTimer = undefined;
+  };
+  const armIdleTimer = (controller: TransformStreamDefaultController<Uint8Array>) => {
+    if (!idleTimeoutMs) return;
+    stopIdleTimer();
+    idleTimer = setTimeout(() => {
+      idleTimer = undefined;
+      controller.error(new UploadContractError(
+        408,
+        'REQUEST_TIMEOUT',
+        `Upload stalled: no data received for ${Math.round(idleTimeoutMs / 1000)} seconds`,
+      ));
+    }, idleTimeoutMs);
+    // Never keep the process alive just for this timer.
+    idleTimer.unref?.();
+  };
+  const limitError = (): UploadContractError | null => {
+    if (receivedBytes > maxBytes) return fileTooLarge(maxBytes, 'Received file data');
+    if (expectedBytes !== undefined && receivedBytes > expectedBytes) {
+      return new UploadContractError(
+        400,
+        'SIZE_MISMATCH',
+        'Received file size does not match Content-Length',
+      );
+    }
+    if (volumeAllowanceBytes !== undefined && receivedBytes > volumeAllowanceBytes) {
+      return new UploadContractError(429, 'RATE_LIMITED', 'Upload rate limit exceeded');
+    }
+    return null;
+  };
+
+  const stream = new TransformStream<Uint8Array, Uint8Array>({
+    start(controller) {
+      armIdleTimer(controller);
+    },
     transform(chunk, controller) {
       receivedBytes += chunk.byteLength;
-      if (receivedBytes > maxBytes) {
-        throw new UploadContractError(
-          413,
-          'FILE_TOO_LARGE',
-          `Received file data exceeds the ${Math.floor(maxBytes / (1024 * 1024))} MB limit`,
-        );
+      const error = limitError();
+      if (error) {
+        stopIdleTimer();
+        throw error;
       }
-      if (expectedBytes !== undefined && receivedBytes > expectedBytes) {
-        throw new UploadContractError(
-          400,
-          'SIZE_MISMATCH',
-          'Received file size does not match Content-Length',
-        );
-      }
+      armIdleTimer(controller);
       controller.enqueue(chunk);
     },
     flush() {
+      stopIdleTimer();
       if (expectedBytes !== undefined && receivedBytes !== expectedBytes) {
         throw new UploadContractError(
           400,
@@ -204,8 +273,19 @@ export function createUploadByteLimitStream(
           'Received file size does not match Content-Length',
         );
       }
+      if (receivedBytes === 0) {
+        throw new UploadContractError(400, 'EMPTY_FILE', 'Empty files are not accepted');
+      }
     },
   });
+
+  return {
+    stream,
+    get receivedBytes() {
+      return receivedBytes;
+    },
+    stop: stopIdleTimer,
+  };
 }
 
 export function resolveUploadMedia(
@@ -227,44 +307,20 @@ export function resolveUploadMedia(
 }
 
 export function buildUploadObjectLocation(input: {
-  productLine: ProductLine;
+  ingestLine: IngestLine;
   productSlug: string;
   safeFilename: string;
   media: UploadMediaRoute;
 }): UploadObjectLocation {
-  if (!PRODUCT_LINES.has(input.productLine)) {
-    throw new UploadContractError(400, 'MALFORMED_REQUEST', 'Product line is not valid');
-  }
-  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(input.productSlug)) {
-    throw new UploadContractError(400, 'INVALID_PRODUCT', 'Product slug is not safe');
-  }
-  if (!/^[a-z0-9][a-z0-9._-]*$/.test(input.safeFilename)) {
-    throw new UploadContractError(400, 'INVALID_FILENAME', 'Filename is not safe');
-  }
-
-  // Deliberately deterministic: the same product and sanitized filename maps
-  // to the same key, so S3/MinIO currently overwrites that object. Versioning
-  // semantics require product-owner confirmation before this rule changes.
-  const key = buildCurrentObjectKey(input);
   const location = {
     bucket: input.media.bucket,
-    key,
+    key: buildUploadObjectKey(input),
   };
   return { ...location, sourceKey: toQdrantSourceKey(location) };
 }
 
-// Keep the existing key format in one replaceable function. The ingest-side
-// parse_key() contract has not been verified, so this is not a proposed format.
-export function buildCurrentObjectKey(input: {
-  productLine: ProductLine;
-  productSlug: string;
-  safeFilename: string;
-}): string {
-  return [input.productLine, input.productSlug, input.safeFilename].join('/');
-}
-
 export function parseUploadRequestMetadata(headers: Headers): UploadRequestMetadata {
-  const productLine = parseProductLine(
+  const businessLine = parseBusinessLine(
     requiredHeader(headers, UPLOAD_HEADERS.productLine),
   );
   const productId = requiredHeader(headers, UPLOAD_HEADERS.productId);
@@ -286,7 +342,7 @@ export function parseUploadRequestMetadata(headers: Headers): UploadRequestMetad
   }
 
   return {
-    productLine,
+    businessLine,
     productId,
     originalFilename,
     declaredMimeType,
@@ -297,17 +353,18 @@ export function parseUploadRequestMetadata(headers: Headers): UploadRequestMetad
 
 export function prepareUploadRequest(headers: Headers) {
   const metadata = parseUploadRequestMetadata(headers);
-  const product = resolveUploadProduct(metadata.productId, metadata.productLine);
+  const product = resolveUploadProduct(metadata.productId, metadata.businessLine);
+  const ingestLine = ingestLineForBusinessLine(product.businessLine);
   const safeFilename = sanitizeUploadFilename(metadata.originalFilename);
   const media = resolveUploadMedia(metadata.declaredMimeType, safeFilename);
   const location = buildUploadObjectLocation({
-    productLine: resolveStorageProductLine(product),
+    ingestLine,
     productSlug: product.slug,
     safeFilename,
     media,
   });
 
-  return { metadata, product, safeFilename, media, location };
+  return { metadata, product, ingestLine, safeFilename, media, location };
 }
 
 export const uploadMediaRoutes = UPLOAD_MEDIA_ROUTES;

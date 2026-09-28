@@ -1,6 +1,4 @@
-import type { Category } from '@/lib/catalog';
-
-export type ProductLine = Category;
+import type { BusinessLine } from '@/lib/admin/upload-domain';
 
 export type UploadStatus =
   | 'pending'
@@ -29,11 +27,12 @@ export const UPLOAD_HEADERS = {
 } as const;
 
 export interface UploadRequestMetadata {
-  productLine: ProductLine;
+  businessLine: BusinessLine;
   productId: string;
   originalFilename: string;
   declaredMimeType: string;
-  declaredSize: number;
+  /** Present only when the request carried Content-Length. */
+  declaredSize?: number;
   csrfToken: string;
 }
 
@@ -43,6 +42,8 @@ export interface UploadSuccessResponse {
   bucket: UploadBucket;
   key: string;
   sourceKey: string;
+  /** Bytes actually received and stored. */
+  size: number;
   status: UploadStatus;
 }
 
@@ -74,7 +75,6 @@ export interface RecentUploadsResponse {
 export type UploadApiErrorCode =
   | 'MALFORMED_REQUEST'
   | 'REQUEST_TIMEOUT'
-  | 'MISSING_CONTENT_LENGTH'
   | 'INVALID_CONTENT_LENGTH'
   | 'EMPTY_FILE'
   | 'FILE_TOO_LARGE'
@@ -88,6 +88,7 @@ export type UploadApiErrorCode =
   | 'UNAUTHENTICATED'
   | 'FORBIDDEN'
   | 'RATE_LIMITED'
+  | 'UPLOAD_CAPACITY_EXHAUSTED'
   | 'BACKEND_NOT_CONFIGURED'
   | 'PARTIAL_DELETE'
   | 'INTERNAL_ERROR';
@@ -106,7 +107,6 @@ export type UploadApiErrorStatus =
 export const UPLOAD_ERROR_STATUS = {
   MALFORMED_REQUEST: 400,
   REQUEST_TIMEOUT: 408,
-  MISSING_CONTENT_LENGTH: 400,
   INVALID_CONTENT_LENGTH: 400,
   EMPTY_FILE: 400,
   FILE_TOO_LARGE: 413,
@@ -120,6 +120,7 @@ export const UPLOAD_ERROR_STATUS = {
   UNAUTHENTICATED: 401,
   FORBIDDEN: 403,
   RATE_LIMITED: 429,
+  UPLOAD_CAPACITY_EXHAUSTED: 503,
   BACKEND_NOT_CONFIGURED: 503,
   PARTIAL_DELETE: 500,
   INTERNAL_ERROR: 500,
@@ -201,9 +202,18 @@ export const ACCEPTED_UPLOAD_EXTENSIONS = Object.freeze(
   ),
 );
 
-export const UPLOAD_INPUT_ACCEPT = ACCEPTED_UPLOAD_EXTENSIONS
-  .map((extension) => `.${extension}`)
-  .join(',');
+/**
+ * react-dropzone `accept` map, derived from the same routes the server
+ * enforces. It filters the file picker only; the server remains authoritative.
+ */
+export const UPLOAD_DROPZONE_ACCEPT: Readonly<Record<string, string[]>> = Object.freeze(
+  Object.fromEntries(
+    Object.values(UPLOAD_MEDIA_ROUTES).map((route) => [
+      route.canonicalMimeType,
+      route.acceptedExtensions.map((extension) => `.${extension}`),
+    ]),
+  ),
+);
 
 export function uploadMediaForExtension(
   extension: string,

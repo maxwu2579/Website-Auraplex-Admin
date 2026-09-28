@@ -12,7 +12,6 @@ export interface MinioConfig {
 export interface QdrantConfig {
   url: string;
   apiKey?: string;
-  collection: string;
 }
 
 export interface KeycloakConfig {
@@ -65,19 +64,20 @@ export function getMinioConfig(env: Environment = process.env): MinioConfig {
   };
 }
 
+// Collections are not configured here: they are routed per ingest line by
+// qdrantCollectionForSourceKey(). QDRANT_COLLECTION is no longer read.
 export function getQdrantConfig(env: Environment = process.env): QdrantConfig {
-  const values = required(env, 'Qdrant', ['QDRANT_URL', 'QDRANT_COLLECTION']);
+  const values = required(env, 'Qdrant', ['QDRANT_URL']);
   return {
     url: httpUrl(values.QDRANT_URL, 'QDRANT_URL'),
     apiKey: env.QDRANT_API_KEY?.trim() || undefined,
-    collection: values.QDRANT_COLLECTION,
   };
 }
 
 export function tryGetQdrantConfig(
   env: Environment = process.env,
 ): QdrantConfig | null {
-  if (!env.QDRANT_URL?.trim() && !env.QDRANT_COLLECTION?.trim()) return null;
+  if (!env.QDRANT_URL?.trim()) return null;
   return getQdrantConfig(env);
 }
 
