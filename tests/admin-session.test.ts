@@ -48,15 +48,16 @@ const keycloak = createFakeKeycloak(KEYCLOAK);
 function authAt(clock: { now: number }): AdminSessionLoader {
   const now = () => clock.now;
   const loader = keycloak.then((fake) => {
+    const coordinator = new RefreshSingleFlight();
     const revalidator = createKeycloakRevalidator({
       config: KEYCLOAK,
       fetcher: fake.fetcher(now),
       now,
       production: false,
-      singleFlight: new RefreshSingleFlight(),
+      singleFlight: coordinator,
     });
-    const { auth } = NextAuth(createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now, revalidator }));
-    return createAdminSessionLoader(auth);
+    const { auth } = NextAuth(createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now, revalidator, coordinator }));
+    return createAdminSessionLoader(auth, undefined, coordinator);
   });
   return async (headers) => (await loader)(headers);
 }
@@ -73,6 +74,9 @@ async function sessionCookie(claims: Record<string, unknown>, groups = ['auraple
         keycloakSub,
         refreshToken: (await keycloak).grant(keycloakSub, groups),
         lastValidatedAt: claims.activeAt,
+        browserInstanceId: `browser-${cookieSerial}`,
+        loginId: `login-${cookieSerial}`,
+        refreshGeneration: 0,
       }
     : {};
   const token = await encode({
@@ -139,15 +143,25 @@ test('Auth.js sign-in callback records the login time from the injected clock', 
 test('a valid active session is accepted and its activity is re-issued', async () => {
   const clock = { now: T0 + 2 * HOUR };
   const cookie = await sessionCookie({ loginAt: sec(T0), activeAt: sec(clock.now - 5 * MINUTE) });
+  // Auth.js stamps the JWT `exp` from the real clock, so bracket the issuance.
+  const issuedNotBefore = sec(Date.now());
   const { session, setCookies } = await authAt(clock)(headersFor(cookie));
+  const issuedNotAfter = sec(Date.now());
   assert.equal((session?.user as { id?: string } | undefined)?.id, 'user-1');
   // Only the session cookie is forwarded, not Auth.js CSRF/callback cookies.
   assert.ok(setCookies.length > 0 && setCookies.every((value) => value.startsWith(COOKIE)));
   const token = await reissued(setCookies);
   assert.equal(token?.activeAt, sec(clock.now));
   assert.equal(token?.loginAt, sec(T0), 'login time is never moved');
-  // The re-issued cookie itself expires after the idle timeout.
-  assert.equal(token?.exp, sec(Date.now()) + ADMIN_SESSION_POLICY.idleTimeoutSeconds);
+  // The re-issued cookie itself expires after the idle timeout: exactly that
+  // long after it was issued, whichever second inside the bracket that was.
+  const exp = token?.exp as number;
+  assert.ok(Number.isInteger(exp));
+  assert.ok(
+    exp >= issuedNotBefore + ADMIN_SESSION_POLICY.idleTimeoutSeconds &&
+      exp <= issuedNotAfter + ADMIN_SESSION_POLICY.idleTimeoutSeconds,
+    `exp ${exp} is the idle timeout after issuance (${issuedNotBefore}..${issuedNotAfter})`,
+  );
 });
 
 test('a session idle for 30 minutes or more is rejected and cleared', async () => {

@@ -5,6 +5,13 @@ import { getKeycloakConfig } from '@/lib/admin/server/config';
 import { identityFromSession, type AdminIdentity } from '@/lib/admin/server/authorization';
 import { authSessionCookieName } from '@/lib/admin/server/auth-cookies';
 import { REVALIDATION_UNAVAILABLE_FLAG } from '@/lib/admin/server/session-policy';
+import { sharedRefreshSingleFlight, type RefreshSingleFlight } from '@/lib/admin/server/keycloak-revalidation';
+import {
+  runInAdminAuthScope,
+  type AdminAuthScope,
+  type SessionEndReason,
+  type SessionReadOutcome,
+} from '@/lib/admin/server/session-context';
 
 export interface LoadedAdminSession {
   session: Session | null;
@@ -25,6 +32,17 @@ export interface LoadedAdminSession {
    * cookie is left as it is, so the browser can retry.
    */
   revalidationUnavailable?: boolean;
+  /**
+   * Why the session was ended, when this read ended it. Internal: it decides
+   * cookie handling only and is never sent to the browser.
+   */
+  endReason?: SessionEndReason;
+  /**
+   * Whether `setCookies` (a re-issued cookie or a removal) must be left out
+   * because the browser's session has moved on since this read. Evaluated when
+   * the response is about to be sent (see sessionCookiesToCommit).
+   */
+  withholdSessionCookies?: () => boolean;
 }
 
 export type AdminSessionLoader = (headers: Headers) => Promise<LoadedAdminSession>;
@@ -42,21 +60,29 @@ type ApiRouteAuth = (
  * That same read performs the 60-second Keycloak revalidation when it is due.
  * Only the session cookie (and its chunks) is forwarded; Auth.js's own CSRF
  * and callback cookies are left to its sign-in/sign-out routes.
+ *
+ * The `jwt` callback reports, through the request scope opened here, which
+ * login and refresh generation the read was about and why a session ended.
+ * `ordering` is the process-wide coordinator those are later compared with.
  */
 export function createAdminSessionLoader(
   auth: unknown,
   sessionCookie = authSessionCookieName(process.env.NODE_ENV === 'production'),
+  ordering: SessionOrdering = sharedRefreshSingleFlight(),
 ): AdminSessionLoader {
   return async (headers) => {
     const response = { headers: new Headers() };
-    const session = await (auth as ApiRouteAuth)({ headers }, response);
+    const scope: AdminAuthScope = {};
+    const session = await runInAdminAuthScope(scope, () => (auth as ApiRouteAuth)({ headers }, response));
     if (session && (session as unknown as Record<string, unknown>)[REVALIDATION_UNAVAILABLE_FLAG]) {
       return { session: null, setCookies: [], revalidationUnavailable: true };
     }
-    const setCookies = response.headers
-      .getSetCookie()
-      .filter((cookie) => /^[^=]+/.exec(cookie)?.[0].startsWith(sessionCookie));
-    if (!session) return { session, setCookies };
+    const setCookies = response.headers.getSetCookie().filter((cookie) => isSessionCookie(cookie, sessionCookie));
+    const { outcome } = scope;
+    const withholdSessionCookies = () => mustWithholdSessionCookies(outcome, ordering);
+    if (!session) {
+      return { session, setCookies, endReason: outcome?.status === 'ended' ? outcome.reason : undefined, withholdSessionCookies };
+    }
     // Auth.js accepted this cookie, and the session callback deliberately
     // leaves the Keycloak subject out of the session JSON, so it is read from
     // the same encrypted JWT. Revalidation never changes it.
@@ -66,8 +92,65 @@ export function createAdminSessionLoader(
       cookieName: sessionCookie,
     }).catch(() => null);
     const keycloakSub = typeof token?.keycloakSub === 'string' && token.keycloakSub ? token.keycloakSub : undefined;
-    return { session, keycloakSub, setCookies };
+    return { session, keycloakSub, setCookies, withholdSessionCookies };
   };
+}
+
+export type SessionOrdering = Pick<RefreshSingleFlight, 'isSuperseded' | 'isCurrentLogin'>;
+
+/** A Set-Cookie header for the Auth.js session cookie or one of its chunks. */
+export function isSessionCookie(setCookie: string, sessionCookie: string): boolean {
+  const name = /^[^=]+/.exec(setCookie)?.[0] ?? '';
+  return name === sessionCookie || name.startsWith(`${sessionCookie}.`);
+}
+
+/**
+ * Whether a response must leave the browser's session cookie alone. It never
+ * changes the response itself: a denied request stays denied and an allowed
+ * one stays allowed.
+ *
+ * - The browser instance has signed out of this login, or signed in again
+ *   since: neither a re-issued cookie nor a removal from the old login is
+ *   applied to the browser's present session.
+ * - Re-issued cookie whose refresh generation has been redeemed by a later
+ *   refresh of the same login: it would put a consumed refresh token (and that
+ *   generation's groups) back.
+ * - Removal because Keycloak refused a refresh token that was already known to
+ *   be replaced: the refusal is about the old token, not the newer session.
+ *
+ * - Sign-out of a login the browser had already left: its removal is not
+ *   applied either. A sign-out of the browser's current login is.
+ * - Revalidation could not be completed: the request is refused and the
+ *   existing cookie is left exactly as it is.
+ *
+ * Every other removal is applied: idle or 12-hour expiry, a refresh that
+ * succeeded but crossed a local limit, Keycloak refusing the login's newest
+ * refresh token, and sessions that cannot be revalidated. Without a reported
+ * outcome (Auth.js could not read the cookie) nothing is withheld.
+ *
+ * This is the one rule for every place that writes the session cookie: the
+ * upload handlers, Proxy and the Auth.js routes (see withBrowserInstance).
+ */
+export function mustWithholdSessionCookies(
+  outcome: SessionReadOutcome | undefined,
+  ordering: SessionOrdering = sharedRefreshSingleFlight(),
+): boolean {
+  if (!outcome) return false;
+  if (outcome.status === 'revalidation-unavailable') return true;
+  if (outcome.status === 'signed-out') return !outcome.wasCurrentLogin;
+  if (!outcome.lineage) return false;
+  if (!ordering.isCurrentLogin(outcome.lineage)) return true;
+  if (outcome.status === 'active') return ordering.isSuperseded(outcome.lineage);
+  return outcome.reason === 'provider-superseded-refresh-rejected';
+}
+
+/**
+ * The session cookies a response may set, decided at the moment it is sent
+ * rather than when the session was read: requests of one browser overlap and
+ * do not finish in the order they started.
+ */
+export function sessionCookiesToCommit(loaded: LoadedAdminSession): string[] {
+  return loaded.withholdSessionCookies?.() ? [] : loaded.setCookies;
 }
 
 export const loadAdminSession: AdminSessionLoader = async (headers) => {
@@ -101,24 +184,26 @@ export function appendSetCookies(response: Response, setCookies: readonly string
  * Keycloak revalidation, and applies the refreshed or cleared session cookie
  * to whatever response the handler returns. The refreshed cookie records
  * activity at request start, when the session was validated; it never moves
- * the fixed 12-hour login boundary.
+ * the fixed 12-hour login boundary. A long upload can outlast a later refresh
+ * of the same session, so whether that cookie is still current is decided
+ * only once the handler has finished (sessionCookiesToCommit).
  */
 export async function withAdminRequestSession(
   request: Request,
   handle: (authenticate: () => Promise<AdminIdentity | null>) => Promise<Response>,
   load: AdminSessionLoader = loadAdminSession,
 ): Promise<Response> {
-  let setCookies: string[] = [];
+  let loaded: LoadedAdminSession | undefined;
   let identity: Promise<AdminIdentity | null> | undefined;
   const authenticate = () => (identity ??= (async () => {
     // Fail with a controlled 503 before invoking Auth.js when Keycloak
     // configuration is absent, rather than pretending SSO was verified.
     getKeycloakConfig();
-    const loaded = await load(request.headers);
-    setCookies = loaded.setCookies;
+    loaded = await load(request.headers);
     return identityFromLoadedSession(loaded);
   })());
-  return appendSetCookies(await handle(authenticate), setCookies);
+  const response = await handle(authenticate);
+  return appendSetCookies(response, loaded ? sessionCookiesToCommit(loaded) : []);
 }
 
 // --- Proxy → page / Route Handler handoff -----------------------------------

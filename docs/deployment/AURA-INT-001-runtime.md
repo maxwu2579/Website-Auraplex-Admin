@@ -5,7 +5,7 @@
 Local automated tests (`npm test`) cover upload validation, the business-line → ingest-line mapping, the object-key and `source_key` contracts, Qdrant collection routing, optional Content-Length with actual byte accounting, complete stream replay after MIME inspection, server-side group/CSRF/rate-limit checks without Proxy, stable error responses, status mapping, deletion order and partial failure. They also cover:
 
 - `tests/admin-session.test.ts` — the 30-minute idle and 12-hour absolute session limits, run through the real Auth.js session pipeline (encrypted session cookies, the app's `jwt` callback, re-issued cookies) with an injected clock, including the Proxy-bypassed upload handler and a Proxy/route-handler consistency matrix.
-- `tests/admin-revalidation.test.ts` — the 60-second Keycloak revalidation against an in-process fake Keycloak (discovery, JWKS, rotating refresh-token endpoint) reached through an injected `fetch`: freshness window, group replacement, `invalid_grant`, outage/5xx/malformed/forged responses, mandatory refresh-token rotation, ID-token `iat` and multiple-audience `azp` rules, the Proxy → handler pipeline across the 60-second mark, upload ownership across logins, concurrent single-flight, interaction with the idle/absolute limits, Proxy/handler consistency, and that provider tokens stay out of the session JSON and logs. No test contacts a real Keycloak.
+- `tests/admin-revalidation.test.ts` — the 60-second Keycloak revalidation against an in-process fake Keycloak (discovery, JWKS, rotating refresh-token endpoint) reached through an injected `fetch`: freshness window, group replacement, `invalid_grant`, outage/5xx/malformed/forged responses, mandatory refresh-token rotation, ID-token `iat` and multiple-audience `azp` rules, the Proxy → handler pipeline across the 60-second mark, upload ownership across logins, concurrent single-flight, response ordering with a simulated browser cookie jar that applies every `Set-Cookie` and removal in completion order (a slow response finishing after a newer refresh, a late `invalid_grant` for a consumed refresh token, three generations out of order, removed groups, `loginAt`, freshness, legitimate removals on idle/12-hour expiry and Keycloak revocation, an old login's late response after a new sign-in or sign-out, two browsers of one user, the native Auth.js `/api/auth/session` and `/api/auth/signout` routes through the real handlers and route wrapper, a probe showing that network arrival order is outside this protection, bounded coordinator state), interaction with the idle/absolute limits, Proxy/handler consistency, and that provider tokens stay out of the session JSON and logs. No test contacts a real Keycloak.
 - `tests/admin-storage.test.ts` — the real AWS SDK against an in-process S3 endpoint: single-part, multipart, abort cleanup, body failure, a delayed or failing `AbortMultipartUpload`, a failed `CompleteMultipartUpload` (with successful, failing and hung abort), stalled clients and a stalled MinIO part upload.
 - `tests/admin-upload-limits.test.ts` — the per-process concurrency guard (capacity, release after success and every failure mode) and rate-limit reserve → settle behaviour.
 - `tests/admin-upload-ui.test.tsx` — the react-dropzone input/accept contract (server-rendered).
@@ -18,7 +18,10 @@ The 2026-09-24 `npm audit` and `npm audit --omit=dev` checks each report 44 depe
 
 - `/admin/upload` is server-gated before the product list or upload workspace renders.
 - `proxy.ts` runs for `/admin/:path*`, `/api/admin` and `/api/admin/*` **except** `/api/admin/uploads`. Whenever Proxy runs, Next.js 16 tees the request body into an in-memory clone capped by `proxyClientMaxBodySize` (default 10 MiB) and truncates the Route Handler's copy at that cap. A local HTTP test reproduced this (Next logged `Request body exceeded 10MB for /api/admin/uploads`, and the handler saw only 10 MiB). Raising the cap would buffer whole uploads in memory, so the upload endpoint is excluded from the matcher instead.
-- Excluding Proxy removes only a first-line check. `GET /api/admin/csrf`, `PUT /api/admin/uploads`, `GET /api/admin/uploads` and `DELETE /api/admin/uploads` each independently authenticate the Auth.js session (including the expiry rules below) and authorize Keycloak ID-token `groups`; `PUT` also enforces double-submit CSRF, rate limits, the concurrency limit and validation, and `DELETE` requires the Admin group plus CSRF. Tests cover anonymous, expired, non-uploader, missing/mismatched CSRF and rate-limited uploads with no Proxy involved.
+- Session authentication happens once per request, in one of two places that share the same code (`lib/admin/server/session.ts`):
+  - **Proxy-covered paths** (`/admin/*`, `GET /api/admin/csrf`): Proxy reads the Auth.js session, applies the expiry rules below and the 60-second Keycloak revalidation, and sets the re-issued or cleared session cookie. It hands the authenticated identity to the page or the CSRF route in an encrypted request header. The CSRF route does **not** read the Auth.js session again; it takes that identity and checks the uploader group itself. Only if the handoff is absent or does not decrypt (Proxy did not run) does it read the session in place, with the same rules.
+  - **`/api/admin/uploads`** (`PUT`, `GET`, `DELETE`) is intentionally excluded from Proxy and runs the common session wrapper (`withAdminRequestSession`) itself: the same session read, revalidation and cookie handling, with no Proxy involved.
+- Every handler authorizes Keycloak ID-token `groups` itself, whichever of the two authenticated the request. `PUT` also enforces double-submit CSRF, rate limits, the concurrency limit and validation, and `DELETE` requires the Admin group plus CSRF. Tests cover anonymous, expired, non-uploader, missing/mismatched CSRF and rate-limited uploads with no Proxy involved.
 - Group names are exact, case-insensitive matches to `KEYCLOAK_UPLOADER_ROLE` and `KEYCLOAK_ADMIN_ROLE`, defaulting to `auraplex-uploader` and `auraplex-admin`. Realm/client roles do not grant access. Configure Keycloak to place groups in the ID token.
 - Logout uses OIDC discovery's `end_session_endpoint` with a server-held `id_token_hint`, clears the Auth.js session, then redirects through Keycloak back to the configured `AUTH_URL` origin. Discovery has a 1.5-second timeout; if unavailable or the ID token is missing, local Auth.js logout still completes and redirects to `/en`. In that fallback the upstream Keycloak SSO session is **not confirmed terminated**. Verify post-logout URI registration in the real client.
 - Auth.js session/CSRF cookies use `HttpOnly`, `SameSite=Lax`, `Path=/`, and `Secure` in production. The production session and CSRF cookies use `__Host-`; transient OIDC cookies use `__Secure-`. Local HTTP development uses unprefixed names and `Secure=false`. The ID token and the Keycloak refresh token are stored only in the encrypted, HttpOnly Auth.js JWT; neither appears in the session JSON, API responses, logs or audit events. The admin double-submit CSRF cookie is `HttpOnly`, `SameSite=Strict`, production `Secure`, and scoped to `/api/admin`.
@@ -72,9 +75,82 @@ Refresh-token rotation and concurrency:
 
 - Parallel browser requests can arrive with the same cookie. Redeeming a rotated refresh token twice would fail, so refreshes are coordinated **in process**: requests with the same refresh state share one Keycloak call, and a successful result is **eligible for reuse for 10 seconds** by requests still carrying the previous cookie. The state is two maps keyed by a SHA-256 digest (not the raw token): refreshes in flight, and reusable results. Each is capped at 256 entries, so up to about 512 entries can exist in total. In-flight entries are removed when the call completes; beyond the cap a refresh is refused (503) rather than queued. Reusable results are cleaned up lazily: an expired entry is never reused, but it is only deleted when it is next looked up, when another result is stored, or when the cap evicts the oldest. The 10 seconds is therefore a reuse limit, not a promise that the entry (which holds the rotated refresh token in memory) is gone at exactly 10 seconds.
 - **These guarantees hold only for the confirmed single Node.js process.** With more than one instance, a second instance would redeem an already-rotated refresh token, be refused, and end the session. Running several instances needs a shared store or sticky routing first.
-- If the browser never receives the response carrying the rotated cookie (for example an aborted request), or Keycloak's answer is rejected after the token was already redeemed, the old refresh token is spent: once the 10-second reuse window has passed, the next request gets 401 and the user signs in again.
+- If the browser does not receive the response carrying the rotated cookie (for example an aborted request), or Keycloak's answer is rejected after the token was already redeemed, the old refresh token is spent: once the 10-second reuse window has passed, the next request gets 401 and the user signs in again. The same applies while a slow request is the only one that has received a new generation: a second request sent with the old cookie more than 10 seconds later, and before the slow response arrives, is refused by Keycloak.
 
-Storing the refresh and ID tokens makes the session cookie larger; Auth.js splits it into chunks (`….session-token.0`, `.1`) above 4 KB and the loader forwards every chunk. Check ingress header-size limits in staging.
+### Response ordering for the session cookie
+
+Requests of one browser overlap, and their responses do not finish in the order the requests started. Every response used to apply its own view of the session cookie: the cookie re-issued from the refresh token that request ended up with, or its removal when that request found the session ended. A response that finished late could therefore undo a newer state:
+
+- a slow request (a long upload) that had refreshed RT0 → RT1 finished after the browser already held RT2, and wrote RT1 back; RT1 is consumed, so the next revalidation was refused and the user signed out;
+- an older request still carrying consumed RT1 was refused by Keycloak (`invalid_grant`) and its 401 removed the cookie, deleting the valid RT2 session;
+- a request of a previous login finished after the same browser had signed in again, and replaced or removed the new login's cookie.
+
+What decides the cookie now is recorded in three places.
+
+**In the encrypted session JWT** (not in the session JSON, and not logged):
+
+| Claim | Meaning |
+|---|---|
+| `browserInstanceId` | Random id of the browser profile the login came from (see below) |
+| `loginId` | Random id of one Keycloak sign-in: the **login lineage**. Fixed for the life of that login; a new sign-in gets a new one |
+| `refreshGeneration` | 0 at sign-in, +1 on every refresh-token rotation of that login |
+
+Sessions issued before this change carry none of these and are rejected once, like sessions issued before revalidation: the user signs in again.
+
+**In a separate browser-instance cookie** (`auraplex.browser-instance`, `__Host-` prefixed in production): an opaque random UUID, `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` in production, about 400 days, set or renewed only on the response that completes a sign-in (`/api/auth/callback/keycloak`). It is **not a credential**: it grants nothing, is not derived from the user and is not compared with a user or group. Its only use is to tell successive logins of one browser profile apart from logins on another browser or device, including for the same Keycloak user. It deliberately survives sign-out. A value that is missing or was not issued by the app is replaced.
+
+**In the process-local coordinator** (the same one that single-flights refreshes):
+
+- per `loginId`, the highest `refreshGeneration` known to exist (one entry per login, however often it rotates);
+- per `browserInstanceId`, the `loginId` that is current there. A sign-in replaces it; a sign-out (the logout action and Auth.js's own sign-out route, through its `signOut` event) marks the browser as having no current login.
+
+Each map holds at most 1024 entries, least recently written evicted first, and entries older than the 12-hour absolute session lifetime are dropped at the next write. A failed refresh records nothing.
+
+**Reason for an ended session.** The `jwt` callback no longer reports every ended session as the same `null`. It hands the session loader an internal reason, used only to decide cookie handling:
+
+| Reason | When |
+|---|---|
+| `local-idle-expired` | 30 minutes without an authenticated admin request |
+| `local-absolute-expired` | 12 hours since `loginAt` |
+| `refresh-succeeded-but-local-session-expired` | Keycloak refreshed the session, but a local limit passed during that round trip |
+| `provider-current-session-rejected` | Keycloak refused the newest refresh token of the login (disabled user, ended SSO session, revoked) |
+| `provider-superseded-refresh-rejected` | Keycloak refused a refresh token that a later successful refresh of the same login had already replaced |
+| `not-revalidatable` | Session without timestamps, refresh state or lineage claims |
+
+(Keycloak being unavailable is not an ended session: the request gets 503 and no cookie is touched, as before.) Authorization is unchanged and fails closed in every case: all of these deny the request.
+
+**Commit rule.** When a response is about to be sent, its session cookie is decided as follows. The HTTP result of the request itself is not changed by any of this.
+
+| Case | Session cookie |
+|---|---|
+| Current login of the browser, current refresh generation | Re-issued cookie is set |
+| Same login, but a newer refresh generation is known | Stale re-issued cookie is **not set** |
+| 401 because Keycloak refused a refresh token already known to be superseded | Removal is **not sent**; the request stays denied |
+| Current login ended by idle or 12-hour expiry, including a refresh that succeeded while the limit passed | Cookie is removed |
+| Current login refused by Keycloak on its newest refresh token | Cookie is removed |
+| Response of a login the browser has signed out of, or has replaced by a newer sign-in | Neither set nor removed |
+| Sign-out of the browser's current login | Cookie is removed |
+| Delayed sign-out of a login the browser has already left | Removal is **not sent**; the request completes as usual |
+| Revalidation could not be completed (503 / unavailable) | Cookie is left exactly as it is |
+| Session that cannot be revalidated, or a cookie Auth.js cannot read | Cookie is removed, as before |
+
+A removal is withheld only for the explicit superseded-refresh reason or for a login that is no longer the browser's current one. In particular it is not withheld merely because the refresh token a request carried has since been rotated: a request whose own refresh succeeded and then crossed the 12-hour limit still removes the cookie.
+
+Where the rule is applied (one shared function, `mustWithholdSessionCookies`, for all three):
+
+- **`/api/admin/uploads`** (direct, Proxy-bypassed): after the handler has finished, i.e. as late as the server can decide, so a long upload is covered.
+- **Proxy-covered paths**: when Proxy hands the request on. Proxy cannot see when the page or handler behind it finishes, so a cookie that was current at handoff can still be overtaken while that code runs. Those requests are short, but this window exists.
+- **The Auth.js routes** (`app/api/auth/[...nextauth]/route.ts`, GET and POST): Auth.js writes the session cookie itself on `/api/auth/session` (re-issue or removal) and `/api/auth/signout` (removal). Both methods run through one wrapper, which applies the rule to the finished Auth.js response using what the callbacks reported while that request was handled; the session is not read a second time. When the rule says the browser's session cookie must be left alone, only the session cookie and its chunks are taken out of the response. Status, body, other headers and all other cookies (CSRF, callback URL, state, PKCE, nonce, the browser-instance cookie) pass through unchanged. A stale `/api/auth/session` request is still answered with no session; it is not turned into a success.
+- The **logout server action** applies the same check before it clears the cookie: a logout submitted from a login the browser has already left does not remove the newer session cookie (the Keycloak logout redirect for the submitted login still happens).
+
+What is and is not protected:
+
+- **Protected (server-side commit decisions):** the cookie written by the direct admin Route Handlers, by Proxy at handoff and by the Auth.js routes; the removal that follows a refused, already superseded refresh token; and responses of an old login versus a newer login of the same browser.
+- **Not protected: network arrival order.** The rule orders responses as the server commits them. Two responses committed in the right order can still reach the browser in the other order, and the browser then keeps the older cookie. With `HttpOnly` cookies there is no small, robust fix for this: a second ordering cookie can itself arrive out of order, and signing a value does not stop an older valid value from being applied later. The consequence is an availability problem, not an authorization one: the next revalidation of that older cookie is refused by Keycloak and the user signs in again. A test demonstrates this case explicitly.
+- **Process-local state, single Node.js instance.** Several instances would each have their own view and would need shared coordination first.
+- **Restart or eviction** loses the ordering knowledge for the affected login or browser; it is then treated as current and its response applies its cookie, which is the behaviour before this change.
+- **Deleted or blocked browser-instance cookie:** the next sign-in starts a new browser instance and is not linked to, or ordered against, the previous login.
+- None of this state authenticates anything. A request arriving with an old cookie is still judged by the session limits and by Keycloak.
 
 ### One session decision per request behind Proxy
 

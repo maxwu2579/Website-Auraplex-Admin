@@ -23,9 +23,12 @@ import {
   createAdminSessionLoader,
   proxiedRequestIdentity,
   sealProxyIdentity,
+  sessionCookiesToCommit,
   withAdminRequestSession,
   type AdminSessionLoader,
 } from '../lib/admin/server/session';
+import { currentAdminAuthScope, runInAdminAuthScope, type AdminAuthScope, type SessionLineage } from '../lib/admin/server/session-context';
+import { browserInstanceCookieName, withBrowserInstance } from '../lib/admin/server/browser-instance';
 import { requireUploadPermission } from '../lib/admin/server/authorization';
 import { getAdminCsrfResponse } from '../lib/admin/server/csrf-service';
 import type { StorageAdapter, StoredObject } from '../lib/admin/server/storage';
@@ -35,6 +38,7 @@ import { deleteUpload } from '../lib/admin/server/delete-service';
 import { UploadConcurrencyGuard } from '../lib/admin/server/upload-concurrency';
 import { createAdminProxy } from '../proxy';
 import { createFakeKeycloak, type FakeKeycloakMode } from './helpers/fake-keycloak';
+import { createBrowserJar } from './helpers/browser-jar';
 
 // Test-only configuration. No request in this file leaves the process: Keycloak
 // is an in-process fake reached through an injected fetch.
@@ -69,6 +73,8 @@ const KC_SUB = 'keycloak-sub-1';
 const warnings: string[] = [];
 console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
 
+let loginSerial = 0;
+
 async function setup(startMs = T0 + 2 * HOUR) {
   const clock = { now: startMs };
   const now = () => clock.now;
@@ -81,10 +87,13 @@ async function setup(startMs = T0 + 2 * HOUR) {
     production: false,
     singleFlight,
   });
-  const { auth, handlers } = NextAuth(
-    createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now, revalidator }),
-  );
-  const load = createAdminSessionLoader(auth);
+  // As in production, the callbacks, the loader and the revalidator share one
+  // coordinator.
+  const config = createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now, revalidator, coordinator: singleFlight });
+  const { auth, handlers } = NextAuth(config);
+  const load = createAdminSessionLoader(auth, undefined, singleFlight);
+  /** The same reads with every session cookie applied, as before response ordering existed. */
+  const loadUnordered: AdminSessionLoader = async (headers) => ({ ...(await load(headers)), withholdSessionCookies: undefined });
 
   /** A session cookie whose Keycloak validation is `validatedAgo` old (default: just due). */
   async function cookie(
@@ -107,13 +116,37 @@ async function setup(startMs = T0 + 2 * HOUR) {
         refreshToken,
         idToken: 'previous-id-token',
         lastValidatedAt: sec(clock.now - validatedAgo),
+        // Each cookie is its own login, from a browser the process has not seen.
+        browserInstanceId: 'browser-unregistered',
+        loginId: `login-${++loginSerial}`,
+        refreshGeneration: 0,
         ...claims,
       },
     });
     return { header: `${COOKIE}=${token}`, refreshToken };
   }
 
-  return { clock, kc, singleFlight, load, handlers, cookie };
+  /** A completed Keycloak sign-in from the given browser, through the app's own `jwt` callback. */
+  async function signIn(browserInstanceId: string, groups = ['auraplex-uploader']) {
+    const refreshToken = kc.grant(KC_SUB, groups);
+    const token = await runInAdminAuthScope({ browserInstanceId }, async () => config.callbacks!.jwt!({
+      token: { sub: APP_SUB, email: 'user@example.test' },
+      user: { id: APP_SUB },
+      account: { provider: 'keycloak', type: 'oidc', providerAccountId: KC_SUB, id_token: 'sign-in-id-token', refresh_token: refreshToken },
+      profile: { sub: KC_SUB, groups },
+    } as never));
+    assert.ok(token);
+    const jwt = await encode({ secret: TEST_ENV.AUTH_SECRET, salt: COOKIE, maxAge: 30 * 24 * 3600, token });
+    return { header: `${COOKIE}=${jwt}`, refreshToken, loginId: token.loginId as string };
+  }
+
+  /** Sign-out as Auth.js reports it to the app (server action or its own route). */
+  async function signOut(cookieHeader: string) {
+    const token = await decode({ secret: TEST_ENV.AUTH_SECRET, salt: COOKIE, token: cookieHeader.slice(COOKIE.length + 1) });
+    await config.events!.signOut!({ token } as never);
+  }
+
+  return { clock, kc, singleFlight, config, load, loadUnordered, handlers, cookie, signIn, signOut };
 }
 
 const headersFor = (cookie?: string) =>
@@ -521,6 +554,1083 @@ test('the single-flight state is bounded, expires, and never reuses a failure', 
   assert.equal(flight.size.inFlight, 0);
 });
 
+// --- Response ordering ------------------------------------------------------
+
+/** The browser cookie jar (tests/helpers/browser-jar.ts): applies every response in arrival order. */
+const { browserWith } = createBrowserJar(COOKIE, TEST_ENV.AUTH_SECRET);
+
+const uploadsRequest = (cookie: string) =>
+  new NextRequest('http://admin.example.test/api/admin/uploads', { headers: headersFor(cookie) });
+
+/** An authenticated request through the upload endpoint's session wrapper. */
+function visit(load: AdminSessionLoader, cookie: string): Promise<Response> {
+  return withAdminRequestSession(uploadsRequest(cookie), async (authenticate) => {
+    try {
+      const identity = await authenticate();
+      return Response.json({ groups: identity?.groups ?? null }, { status: identity ? 200 : 401 });
+    } catch {
+      return Response.json({ groups: null }, { status: 503 });
+    }
+  }, load);
+}
+
+/**
+ * The same, but the handler keeps working after it authenticated (a long
+ * upload) until `finish()` is called. `authenticated` settles once the session
+ * was read, i.e. after any refresh this request performed.
+ */
+function slowVisit(load: AdminSessionLoader, cookie: string) {
+  let finishHandler!: () => void;
+  const working = new Promise<void>((resolve) => { finishHandler = resolve; });
+  let markAuthenticated!: () => void;
+  const authenticated = new Promise<void>((resolve) => { markAuthenticated = resolve; });
+  const response = withAdminRequestSession(uploadsRequest(cookie), async (authenticate) => {
+    const identity = await authenticate();
+    markAuthenticated();
+    await working;
+    return Response.json({ groups: identity?.groups ?? null }, { status: identity ? 200 : 401 });
+  }, load);
+  return { authenticated, finish: () => { finishHandler(); return response; } };
+}
+
+const lineageOf = (token: Record<string, unknown> | null): SessionLineage => ({
+  browserInstanceId: token?.browserInstanceId as string,
+  loginId: token?.loginId as string,
+  refreshGeneration: token?.refreshGeneration as number,
+});
+
+/**
+ * Slow request refreshes RT0 → RT1 and keeps running; the browser gets RT1
+ * from a parallel request, later refreshes RT1 → RT2 and receives it; only
+ * then does the slow response arrive.
+ */
+async function staleResponseRace(env: Awaited<ReturnType<typeof setup>>, load: AdminSessionLoader) {
+  const { clock, kc, cookie } = env;
+  const login = await cookie();
+  const browser = browserWith(login.header);
+
+  const slow = slowVisit(load, browser.cookie);
+  await slow.authenticated;
+  assert.deepEqual(kc.presented, [login.refreshToken], 'the slow request redeemed RT0');
+
+  // A parallel request sent with the RT0 cookie shares that refresh.
+  browser.receive(await visit(load, browser.cookie));
+  const rt1Cookie = browser.cookie;
+  const rt1 = (await browser.token())?.refreshToken as string;
+  assert.ok(rt1 && rt1 !== login.refreshToken);
+  assert.equal(kc.calls.token, 1);
+
+  // One window later the browser, holding RT1, refreshes again and gets RT2.
+  clock.now += WINDOW;
+  const newer = browser.receive(await visit(load, browser.cookie));
+  assert.equal(newer.status, 200);
+  const rt2 = (await browser.token())?.refreshToken as string;
+  assert.deepEqual(kc.presented, [login.refreshToken, rt1]);
+  assert.ok(rt2 && rt2 !== rt1);
+  const current = lineageOf(await browser.token());
+  assert.deepEqual(
+    [0, 1, 2].map((refreshGeneration) => env.singleFlight.isSuperseded({ ...current, refreshGeneration })),
+    [true, true, false],
+  );
+
+  // The slow request finishes last. It was prepared from generation 1.
+  const late = await slow.finish();
+  assert.equal(late.status, 200, 'the slow request itself still succeeds');
+  browser.receive(late);
+  return { browser, late, rt0: login.refreshToken, rt1, rt1Cookie, rt2 };
+}
+
+test('stale-cookie race: without response ordering the late response rolls the browser back to consumed RT1', async () => {
+  const env = await setup();
+  const { clock, kc, loadUnordered } = env;
+  const { browser, late, rt0, rt1 } = await staleResponseRace(env, loadUnordered);
+
+  assert.equal((await reissued(late.headers.getSetCookie()))?.refreshToken, rt1);
+  assert.equal((await browser.token())?.refreshToken, rt1, 'rolled back to a consumed generation');
+
+  // Once the reuse window and the freshness window have passed, RT1 is
+  // presented again, Keycloak refuses it and the user is signed out.
+  clock.now += WINDOW;
+  const next = browser.receive(await visit(loadUnordered, browser.cookie));
+  assert.equal(next.status, 401);
+  assert.equal(browser.signedIn, false);
+  assert.deepEqual(kc.presented, [rt0, rt1, rt1]);
+});
+
+test('stale-cookie race: a late response from an older refresh generation does not overwrite the newer cookie', async () => {
+  const env = await setup();
+  const { clock, kc, load } = env;
+  const { browser, late, rt0, rt1, rt2 } = await staleResponseRace(env, load);
+
+  assert.deepEqual(late.headers.getSetCookie(), [], 'the stale response sets no session cookie');
+  assert.equal((await browser.token())?.refreshToken, rt2, 'the browser keeps the newest generation');
+  assert.equal((await browser.token())?.refreshGeneration, 2);
+
+  // The session carries on: the next refresh presents RT2, never RT1 again.
+  clock.now += WINDOW;
+  const next = browser.receive(await visit(load, browser.cookie));
+  assert.equal(next.status, 200);
+  assert.equal(browser.signedIn, true);
+  assert.deepEqual(kc.presented, [rt0, rt1, rt2]);
+});
+
+test('a late invalid_grant for consumed RT1 is denied but does not clear the browser\'s RT2 session', async () => {
+  const env = await setup();
+  const { clock, kc, load } = env;
+  const { browser, rt0, rt1, rt1Cookie, rt2 } = await staleResponseRace(env, load);
+
+  // An older request still carrying RT1 is processed after the reuse window.
+  clock.now += REFRESH_RESULT_REUSE_MS;
+  const late = await upload(load, rt1Cookie);
+  assert.equal(late.response.status, 401, 'the stale token is not treated as valid');
+  assert.equal(await code(late.response), 'UNAUTHENTICATED');
+  assert.equal(late.puts, 0, 'nothing protected ran');
+  assert.deepEqual(kc.presented, [rt0, rt1, rt1], 'Keycloak was asked and refused RT1');
+  assert.deepEqual(late.response.headers.getSetCookie(), [], 'no removal of the session cookie');
+
+  // The same request through Proxy.
+  const proxied = await createAdminProxy(load)(csrfRequest(rt1Cookie));
+  assert.equal(proxied.status, 401);
+  assert.deepEqual(proxied.headers.getSetCookie(), []);
+
+  // Both responses reach the browser after it already holds RT2.
+  browser.receive(late.response);
+  browser.receive(proxied);
+  assert.equal(browser.signedIn, true);
+  assert.equal((await browser.token())?.refreshToken, rt2);
+
+  // Internally the reason is explicit, and Auth.js did produce a removal.
+  const loaded = await load(headersFor(rt1Cookie));
+  assert.equal(loaded.session, null);
+  assert.equal(loaded.endReason, 'provider-superseded-refresh-rejected');
+  assert.ok(clearsSession(loaded.setCookies));
+  assert.deepEqual(sessionCookiesToCommit(loaded), []);
+
+  // The RT2 session is intact and still inside its freshness window.
+  const calls = kc.calls.token;
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+  assert.equal(kc.calls.token, calls);
+  clock.now += WINDOW;
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+  assert.equal(kc.presented.at(-1), rt2);
+});
+
+test('without that rule the late invalid_grant response deletes the valid RT2 session', async () => {
+  const env = await setup();
+  const { clock, load, loadUnordered } = env;
+  const { browser, rt1Cookie } = await staleResponseRace(env, load);
+  clock.now += REFRESH_RESULT_REUSE_MS;
+  const late = browser.receive(await visit(loadUnordered, rt1Cookie));
+  assert.equal(late.status, 401);
+  assert.equal(browser.signedIn, false);
+});
+
+test('Keycloak refusing the current generation ends the session and clears the cookie', async () => {
+  const env = await setup();
+  const { clock, kc, load } = env;
+  const { browser, rt2 } = await staleResponseRace(env, load);
+
+  // The user is disabled (or the SSO session ended): RT2, the newest refresh
+  // token of this login, is refused at the next revalidation.
+  kc.disable(KC_SUB);
+  clock.now += WINDOW;
+  const loaded = await load(headersFor(browser.cookie));
+  assert.equal(loaded.session, null);
+  assert.equal(loaded.endReason, 'provider-current-session-rejected');
+  assert.ok(clearsSession(sessionCookiesToCommit(loaded)));
+
+  const denied = browser.receive(await visit(load, browser.cookie));
+  assert.equal(denied.status, 401);
+  assert.equal(kc.presented.at(-1), rt2);
+  assert.equal(browser.signedIn, false, 'the cookie was removed');
+});
+
+test('idle expiry of the current session clears the cookie', async () => {
+  const env = await setup();
+  const { clock, kc, load } = env;
+  const { browser } = await staleResponseRace(env, load);
+  const calls = kc.calls.token;
+
+  clock.now += IDLE;
+  const loaded = await load(headersFor(browser.cookie));
+  assert.equal(loaded.endReason, 'local-idle-expired');
+  assert.ok(clearsSession(sessionCookiesToCommit(loaded)));
+
+  const denied = browser.receive(await visit(load, browser.cookie));
+  assert.equal(denied.status, 401);
+  assert.equal(browser.signedIn, false);
+  assert.equal(kc.calls.token, calls, 'Keycloak is not contacted for an idle session');
+});
+
+test('three refresh generations completing out of order leave the browser on the newest', async () => {
+  const { clock, kc, load, cookie } = await setup();
+  const login = await cookie();
+  const browser = browserWith(login.header);
+
+  // Generation 1: slow request A refreshes RT0; the browser gets RT1 in parallel.
+  const slowA = slowVisit(load, browser.cookie);
+  await slowA.authenticated;
+  browser.receive(await visit(load, browser.cookie));
+  const rt1 = (await browser.token())?.refreshToken;
+
+  // Generation 2: slow request B refreshes RT1; the browser gets RT2 in parallel.
+  clock.now += WINDOW;
+  const slowB = slowVisit(load, browser.cookie);
+  await slowB.authenticated;
+  browser.receive(await visit(load, browser.cookie));
+  const rt2 = (await browser.token())?.refreshToken;
+
+  // Generation 3: slow request C refreshes RT2. Nothing else delivers RT3.
+  clock.now += WINDOW;
+  const slowC = slowVisit(load, browser.cookie);
+  await slowC.authenticated;
+  assert.deepEqual(kc.presented, [login.refreshToken, rt1, rt2]);
+
+  // Completion order: newest, oldest, middle.
+  const newest = browser.receive(await slowC.finish());
+  const committed = await reissued(newest.headers.getSetCookie());
+  const rt3 = committed?.refreshToken;
+  assert.ok(rt3 && rt3 !== rt2, 'the current generation is still committed');
+  assert.equal(committed?.refreshGeneration, 3);
+  const oldest = browser.receive(await slowA.finish());
+  const middle = browser.receive(await slowB.finish());
+  assert.deepEqual(oldest.headers.getSetCookie(), []);
+  assert.deepEqual(middle.headers.getSetCookie(), []);
+  assert.equal((await browser.token())?.refreshToken, rt3);
+
+  clock.now += WINDOW;
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+  assert.deepEqual(kc.presented, [login.refreshToken, rt1, rt2, rt3]);
+  assert.equal((await browser.token())?.refreshGeneration, 4);
+});
+
+test('a stale response cannot restore removed groups', async () => {
+  const { clock, kc, load, cookie } = await setup();
+  const login = await cookie({ groups: ['auraplex-uploader', 'auraplex-admin'] });
+  const browser = browserWith(login.header);
+
+  const slow = slowVisit(load, browser.cookie);
+  await slow.authenticated;
+  browser.receive(await visit(load, browser.cookie));
+  assert.deepEqual((await browser.token())?.groups, ['auraplex-uploader', 'auraplex-admin']);
+
+  // Both groups are removed in Keycloak; the next refresh picks that up.
+  kc.setGroups(KC_SUB, ['staff']);
+  clock.now += WINDOW;
+  browser.receive(await visit(load, browser.cookie));
+  assert.deepEqual((await browser.token())?.groups, ['staff']);
+
+  // The slow request was authorised with the old groups and finishes now.
+  const late = browser.receive(await slow.finish());
+  assert.deepEqual(late.headers.getSetCookie(), []);
+  assert.deepEqual((await browser.token())?.groups, ['staff'], 'the old groups are not written back');
+
+  const denied = await upload(load, browser.cookie);
+  assert.equal(denied.response.status, 403);
+  assert.equal(denied.puts, 0);
+  const deleted = await remove(load, browser.cookie);
+  assert.equal(deleted.response.status, 403);
+  assert.deepEqual(deleted.calls, []);
+});
+
+test('a stale response cannot extend loginAt, and the 12-hour limit clears the cookie', async () => {
+  const env = await setup();
+  const { clock, kc, load } = env;
+  const loginMs = clock.now - HOUR;
+  const { browser, late } = await staleResponseRace(env, load);
+  assert.deepEqual(late.headers.getSetCookie(), []);
+  const token = await browser.token();
+  assert.equal(token?.loginAt, sec(loginMs), 'loginAt is the original sign-in time');
+  assert.equal(token?.activeAt, sec(clock.now), 'activity is that of the newest response');
+
+  // Kept active, the session still ends exactly 12 hours after sign-in.
+  const refreshes = kc.calls.token;
+  for (clock.now += 20 * MINUTE; clock.now < loginMs + ABSOLUTE; clock.now += 20 * MINUTE) {
+    assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+    assert.equal((await browser.token())?.loginAt, sec(loginMs));
+  }
+  assert.ok(kc.calls.token > refreshes);
+  clock.now = loginMs + ABSOLUTE;
+  const calls = kc.calls.token;
+  const loaded = await load(headersFor(browser.cookie));
+  assert.equal(loaded.endReason, 'local-absolute-expired');
+  assert.ok(clearsSession(sessionCookiesToCommit(loaded)));
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 401);
+  assert.equal(browser.signedIn, false);
+  assert.equal(kc.calls.token, calls);
+});
+
+test('a refresh that succeeds while the 12-hour limit passes still ends the session and clears the cookie', async () => {
+  // During the Keycloak round trip: the refresh itself made the cookie this
+  // request carried a superseded generation, which must not hide the removal.
+  const { clock, kc, load, cookie, singleFlight } = await setup(T0 + 20 * HOUR);
+  const login = await cookie({ loginAt: sec(clock.now - ABSOLUTE + 2 * SECOND) });
+  const browser = browserWith(login.header);
+  const carried = lineageOf(await browser.token());
+  kc.duringTokenRequest = () => { clock.now += 3 * SECOND; };
+
+  let endReason: string | undefined;
+  const observed: AdminSessionLoader = async (headers) => {
+    const loaded = await load(headers);
+    endReason = loaded.endReason;
+    return loaded;
+  };
+  const denied = await visit(observed, browser.cookie);
+  assert.equal(kc.calls.token, 1, 'the session was still valid when the refresh started');
+  assert.equal(denied.status, 401);
+  assert.equal(endReason, 'refresh-succeeded-but-local-session-expired');
+  assert.equal(singleFlight.isSuperseded(carried), true, 'the refresh did rotate the token');
+  assert.ok(clearsSession(denied.headers.getSetCookie()), 'the removal is not withheld');
+  browser.receive(denied);
+  assert.equal(browser.signedIn, false);
+
+  // While the handler is still working: the refresh and the request succeed,
+  // the limit passes before the response is sent, and the next request ends it.
+  const other = await setup(T0 + 20 * HOUR);
+  const loginAt = sec(other.clock.now - ABSOLUTE + MINUTE);
+  const second = await other.cookie({ loginAt });
+  const jar = browserWith(second.header);
+  const slow = slowVisit(other.load, jar.cookie);
+  await slow.authenticated;
+  assert.equal(other.kc.calls.token, 1);
+  other.clock.now += 2 * MINUTE;
+  assert.equal(jar.receive(await slow.finish()).status, 200);
+  assert.equal((await jar.token())?.loginAt, loginAt, 'loginAt did not move');
+  const ended = await other.load(headersFor(jar.cookie));
+  assert.equal(ended.endReason, 'local-absolute-expired');
+  assert.equal(jar.receive(await visit(other.load, jar.cookie)).status, 401);
+  assert.equal(jar.signedIn, false);
+  assert.equal(other.kc.calls.token, 1, 'no refresh is attempted past the limit');
+});
+
+test('a stale response or cookie cannot bypass the 60-second freshness window', async () => {
+  const env = await setup();
+  const { clock, kc, load, singleFlight } = env;
+  const { browser, rt2 } = await staleResponseRace(env, load);
+  const validatedAt = (await browser.token())?.lastValidatedAt;
+  assert.equal(validatedAt, sec(clock.now), 'freshness is that of the newest refresh');
+
+  // 59 s after the newest validation: served from the cookie, no Keycloak call.
+  clock.now += WINDOW - SECOND;
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+  assert.equal(kc.calls.token, 2);
+  assert.equal((await browser.token())?.lastValidatedAt, validatedAt);
+
+  // At 60 s the session revalidates, with RT2, exactly once.
+  clock.now += SECOND;
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+  assert.equal(kc.calls.token, 3);
+  assert.equal(kc.presented.at(-1), rt2);
+  assert.equal((await browser.token())?.lastValidatedAt, sec(clock.now));
+  assert.equal(singleFlight.size.inFlight, 0);
+});
+
+// --- Old login versus new login in the same browser ---------------------------
+
+test('a response of the old login that finishes after a new sign-in does not replace the new session', async () => {
+  for (const ordered of [true, false]) {
+    const { clock, load, loadUnordered, signIn } = await setup();
+    const loader = ordered ? load : loadUnordered;
+    const oldLogin = await signIn('browser-a');
+    const browser = browserWith(oldLogin.header);
+
+    // A request of the old login is in flight; it refreshed and keeps working.
+    clock.now += WINDOW;
+    const slow = slowVisit(loader, browser.cookie);
+    await slow.authenticated;
+
+    // The same browser signs in again and holds the new login's cookie.
+    const newLogin = await signIn('browser-a');
+    browser.set(newLogin.header);
+    assert.notEqual(newLogin.loginId, oldLogin.loginId);
+
+    const late = browser.receive(await slow.finish());
+    assert.equal(late.status, 200, 'the old request\'s own result is unchanged');
+    if (!ordered) {
+      // What used to happen: the old login's cookie replaced the new one.
+      assert.equal((await browser.token())?.loginId, oldLogin.loginId);
+      continue;
+    }
+    assert.deepEqual(late.headers.getSetCookie(), []);
+    assert.equal((await browser.token())?.loginId, newLogin.loginId);
+    assert.equal((await browser.token())?.refreshToken, newLogin.refreshToken);
+    assert.equal(browser.receive(await visit(loader, browser.cookie)).status, 200);
+    assert.equal((await browser.token())?.loginId, newLogin.loginId);
+  }
+});
+
+test('a late removal from the old login does not delete the new login', async () => {
+  for (const ordered of [true, false]) {
+    const { clock, kc, load, loadUnordered, signIn } = await setup();
+    const loader = ordered ? load : loadUnordered;
+    const oldLogin = await signIn('browser-a');
+    clock.now += WINDOW;
+
+    // The old Keycloak session ended; the browser signed in again.
+    kc.revoke(oldLogin.refreshToken);
+    const newLogin = await signIn('browser-a');
+    const browser = browserWith(newLogin.header);
+
+    // A request sent with the old cookie is answered only now.
+    const late = browser.receive(await visit(loader, oldLogin.header));
+    assert.equal(late.status, 401, 'the old request stays denied');
+    if (!ordered) {
+      assert.equal(browser.signedIn, false, 'what used to happen: the new login was deleted');
+      continue;
+    }
+    assert.deepEqual(late.headers.getSetCookie(), []);
+    assert.equal(browser.signedIn, true);
+    assert.equal((await browser.token())?.loginId, newLogin.loginId);
+    // It was the old login's newest token, so this is not the superseded-refresh
+    // rule: the removal is withheld because the browser has a newer login.
+    const loaded = await load(headersFor(oldLogin.header));
+    assert.equal(loaded.endReason, 'provider-current-session-rejected');
+    assert.deepEqual(sessionCookiesToCommit(loaded), []);
+
+    // An old cookie that idles out is no different.
+    const idle = await setup();
+    const stale = await idle.signIn('browser-a');
+    idle.clock.now += IDLE - MINUTE;
+    const fresh = await idle.signIn('browser-a');
+    const jar = browserWith(fresh.header);
+    idle.clock.now += MINUTE;
+    const expired = jar.receive(await visit(idle.load, stale.header));
+    assert.equal(expired.status, 401);
+    assert.deepEqual(expired.headers.getSetCookie(), []);
+    assert.equal((await jar.token())?.loginId, fresh.loginId);
+    assert.equal(jar.receive(await visit(idle.load, jar.cookie)).status, 200);
+  }
+});
+
+test('after sign-out a late response of that login does not sign the browser back in', async () => {
+  const { clock, load, signIn, signOut } = await setup();
+  const oldLogin = await signIn('browser-a');
+  const browser = browserWith(oldLogin.header);
+  clock.now += WINDOW;
+  const first = slowVisit(load, browser.cookie);
+  await first.authenticated;
+  const second = slowVisit(load, browser.cookie);
+  await second.authenticated;
+
+  // Sign-out retires the login for this browser and removes the cookie.
+  await signOut(browser.cookie);
+  browser.set(null);
+  const late = browser.receive(await first.finish());
+  assert.equal(late.status, 200);
+  assert.deepEqual(late.headers.getSetCookie(), []);
+  assert.equal(browser.signedIn, false, 'the sign-out is not undone');
+
+  // After the next sign-in the remaining old response is still ignored.
+  const newLogin = await signIn('browser-a');
+  browser.set(newLogin.header);
+  browser.receive(await second.finish());
+  assert.equal((await browser.token())?.loginId, newLogin.loginId);
+  assert.equal(browser.receive(await visit(load, browser.cookie)).status, 200);
+});
+
+test("Auth.js's own sign-out route retires the login, and its callbacks run inside the request scope", async () => {
+  const { clock, load, handlers, singleFlight, signIn } = await setup();
+  const login = await signIn('browser-a');
+  const browser = browserWith(login.header);
+  clock.now += WINDOW;
+  const slow = slowVisit(load, browser.cookie);
+  await slow.authenticated;
+  const lineage = lineageOf(await browser.token());
+  assert.equal(singleFlight.isCurrentLogin(lineage), true);
+
+  // The scope opened around the real Auth.js handler reaches the jwt callback.
+  const scope: AdminAuthScope = {};
+  const read = await runInAdminAuthScope(scope, () => handlers.GET(
+    new NextRequest('http://admin.example.test/api/auth/session', { headers: headersFor(browser.cookie) }),
+  ));
+  assert.equal(read.status, 200);
+  assert.equal(scope.outcome?.status, 'active');
+  browser.receive(read);
+
+  // POST /api/auth/signout with Auth.js's CSRF token, as its sign-out form does.
+  const csrf = await handlers.GET(new NextRequest('http://admin.example.test/api/auth/csrf', { headers: headersFor() }));
+  const { csrfToken } = (await csrf.json()) as { csrfToken: string };
+  const csrfCookie = csrf.headers.getSetCookie().find((value) => value.includes('csrf-token'))!.split(';', 1)[0];
+  const signedOut = await handlers.POST(new NextRequest('http://admin.example.test/api/auth/signout', {
+    method: 'POST',
+    headers: {
+      host: 'admin.example.test',
+      'content-type': 'application/x-www-form-urlencoded',
+      cookie: `${browser.cookie}; ${csrfCookie}`,
+    },
+    body: new URLSearchParams({ csrfToken }).toString(),
+  }));
+  assert.ok(clearsSession(signedOut.headers.getSetCookie()));
+  browser.receive(signedOut);
+  assert.equal(browser.signedIn, false);
+  assert.equal(singleFlight.isCurrentLogin(lineage), false, 'the login is no longer current for this browser');
+
+  const late = browser.receive(await slow.finish());
+  assert.deepEqual(late.headers.getSetCookie(), []);
+  assert.equal(browser.signedIn, false);
+});
+
+test('two browsers of the same Keycloak user are independent: a new login in one does not retire the other', async () => {
+  const { clock, kc, load, signIn } = await setup();
+  const a1 = await signIn('browser-a');
+  const b1 = await signIn('browser-b');
+  const browserB = browserWith(b1.header);
+
+  clock.now += WINDOW;
+  const slowA = slowVisit(load, a1.header);
+  await slowA.authenticated;
+  // Browser A signs in again; browser B does nothing.
+  const a2 = await signIn('browser-a');
+  const browserA = browserWith(a2.header);
+
+  // B's session keeps refreshing and committing its cookies.
+  const refreshedB = browserB.receive(await visit(load, browserB.cookie));
+  assert.equal(refreshedB.status, 200);
+  assert.ok(nextCookie(refreshedB.headers.getSetCookie()), 'browser B still receives its cookie');
+  assert.equal((await browserB.token())?.loginId, b1.loginId);
+  assert.equal((await browserB.token())?.refreshGeneration, 1);
+  assert.equal((await browserB.token())?.keycloakSub, (await browserA.token())?.keycloakSub);
+
+  // Only A's old login is ignored.
+  const lateA = browserA.receive(await slowA.finish());
+  assert.deepEqual(lateA.headers.getSetCookie(), []);
+  assert.equal((await browserA.token())?.loginId, a2.loginId);
+
+  // B's own session ending is still B's: its cookie is removed, A is untouched.
+  kc.revoke((await browserB.token())?.refreshToken as string);
+  clock.now += WINDOW;
+  assert.equal(browserB.receive(await visit(load, browserB.cookie)).status, 401);
+  assert.equal(browserB.signedIn, false);
+  assert.equal(browserA.receive(await visit(load, browserA.cookie)).status, 200);
+  assert.equal((await browserA.token())?.loginId, a2.loginId);
+});
+
+test('the browser-instance cookie is opaque, HttpOnly and bound to a login only at sign-in', async () => {
+  const { config, load, cookie, singleFlight } = await setup();
+  const name = browserInstanceCookieName(false);
+  const signInHandler = async () => {
+    const token = await config.callbacks!.jwt!({
+      token: { sub: APP_SUB },
+      user: { id: APP_SUB },
+      account: { provider: 'keycloak', type: 'oidc', providerAccountId: KC_SUB, id_token: 'id-token', refresh_token: 'refresh-token' },
+      profile: { sub: KC_SUB, groups: [] },
+    } as never);
+    // As Auth.js answers the OIDC callback: a redirect carrying its own cookies.
+    const response = new Response(null, { status: 302, headers: { location: 'http://admin.example.test/admin/upload' } });
+    response.headers.append('set-cookie', `${COOKIE}=session; Path=/; HttpOnly`);
+    response.headers.append('set-cookie', 'authjs.callback-url=x; Path=/');
+    return { response, token };
+  };
+  const callback = (cookieHeader?: string) =>
+    new Request('http://admin.example.test/api/auth/callback/keycloak', { headers: headersFor(cookieHeader) });
+  const run = async (request: Request, production = false) => {
+    let token: Record<string, unknown> | null = null;
+    const response = await withBrowserInstance(request, async () => {
+      const result = await signInHandler();
+      token = result.token;
+      return result.response;
+    }, { production, ordering: singleFlight });
+    return { response, token: token as Record<string, unknown> | null };
+  };
+
+  // First sign-in from a browser: a new random id, in its own cookie.
+  const first = await run(callback());
+  const issued = first.response.headers.getSetCookie().find((value) => value.startsWith(`${name}=`))!;
+  const id = issued.split(';', 1)[0].slice(name.length + 1);
+  assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+  assert.equal(first.token?.browserInstanceId, id, 'the login is bound to it');
+  assert.match(issued, /; HttpOnly/);
+  assert.match(issued, /; SameSite=Lax/);
+  assert.match(issued, /; Path=\//);
+  assert.match(issued, /; Max-Age=\d+/);
+  assert.doesNotMatch(issued, /Secure/, 'plain HTTP in local development');
+  assert.equal(first.response.status, 302);
+  assert.equal(first.response.headers.getSetCookie().length, 3, "Auth.js's own cookies are kept");
+  for (const secret of [KC_SUB, APP_SUB, 'user@example.test']) assert.equal(id.includes(secret), false);
+
+  // The next sign-in from the same browser reuses it, with a new login id.
+  const second = await run(callback(`${name}=${id}`));
+  assert.equal(second.token?.browserInstanceId, id);
+  assert.notEqual(second.token?.loginId, first.token?.loginId);
+  assert.ok(second.response.headers.getSetCookie().some((value) => value.startsWith(`${name}=${id};`)));
+
+  // A value this app did not issue is replaced, not trusted.
+  const forged = await run(callback(`${name}=${KC_SUB}`));
+  assert.notEqual(forged.token?.browserInstanceId, KC_SUB);
+  assert.match(String(forged.token?.browserInstanceId), /^[0-9a-f-]{36}$/);
+
+  // Production: __Host- prefix and Secure.
+  const production = await run(callback(), true);
+  const secure = production.response.headers.getSetCookie().find((value) => value.startsWith('__Host-auraplex.browser-instance='))!;
+  assert.match(secure, /; Secure/);
+  assert.match(secure, /; HttpOnly/);
+
+  // Other Auth.js requests (here a session read) do not set it, and it is not
+  // part of the browser-visible session.
+  const { header } = await cookie({ validatedAgo: 0 });
+  const sessionRead = await withBrowserInstance(
+    new Request('http://admin.example.test/api/auth/session', { headers: headersFor(header) }),
+    async (request) => Response.json((await load(request.headers)).session),
+  );
+  assert.equal(sessionRead.headers.getSetCookie().length, 0);
+  const body = await sessionRead.text();
+  for (const hidden of ['browserInstanceId', 'loginId', 'refreshGeneration', 'browser-unregistered']) {
+    assert.equal(body.includes(hidden), false);
+  }
+});
+
+// --- Native Auth.js routes behind the route wrapper ---------------------------
+
+type Env = Awaited<ReturnType<typeof setup>>;
+
+/** The app's /api/auth route: the real Auth.js handlers behind the real wrapper. */
+function authRouteOf(env: Env) {
+  return (request: NextRequest) => withBrowserInstance(
+    request,
+    request.method === 'POST' ? env.handlers.POST : env.handlers.GET,
+    { production: false, ordering: env.singleFlight },
+  );
+}
+
+const sessionRequest = (cookie?: string) =>
+  new NextRequest('http://admin.example.test/api/auth/session', { headers: headersFor(cookie) });
+
+/** POST /api/auth/signout as Auth.js's sign-out form sends it, CSRF token included. */
+async function signOutRequest(route: (request: NextRequest) => Promise<Response>, cookie: string) {
+  const csrf = await route(new NextRequest('http://admin.example.test/api/auth/csrf', { headers: headersFor() }));
+  const { csrfToken } = (await csrf.json()) as { csrfToken: string };
+  const csrfCookie = csrf.headers.getSetCookie().find((value) => value.includes('csrf-token'))!.split(';', 1)[0];
+  return new NextRequest('http://admin.example.test/api/auth/signout', {
+    method: 'POST',
+    headers: {
+      host: 'admin.example.test',
+      'content-type': 'application/x-www-form-urlencoded',
+      cookie: `${cookie}; ${csrfCookie}`,
+    },
+    body: new URLSearchParams({ csrfToken }).toString(),
+  });
+}
+
+const sessionCookiesIn = (response: Response) =>
+  response.headers.getSetCookie().filter((value) => value.startsWith(COOKIE));
+const otherCookieNamesIn = (response: Response) =>
+  response.headers.getSetCookie().filter((value) => !value.startsWith(COOKIE)).map((value) => value.split('=', 1)[0]).sort();
+const sessionBody = async (response: Response) => JSON.parse(await response.text()) as { user?: { groups?: string[] } } | null;
+
+test('native /api/auth/session: a stale RT1 read is answered null but does not delete the RT2 session', async () => {
+  const env = await setup();
+  const { clock, kc, load, handlers } = env;
+  const route = authRouteOf(env);
+  const { browser, rt1, rt1Cookie, rt2 } = await staleResponseRace(env, load);
+  clock.now += REFRESH_RESULT_REUSE_MS;
+
+  // What Auth.js answers on its own: no session, and a removal of the cookie.
+  const unwrapped = await handlers.GET(sessionRequest(rt1Cookie));
+  assert.equal(await sessionBody(unwrapped), null);
+  assert.ok(clearsSession(unwrapped.headers.getSetCookie()), 'the unfiltered response would delete the session');
+
+  // The same request through the app's route.
+  const stale = await route(sessionRequest(rt1Cookie));
+  assert.equal(stale.status, 200);
+  assert.equal(await sessionBody(stale), null, 'the stale request is not turned into a session');
+  assert.equal(kc.presented.at(-1), rt1, 'Keycloak was asked and refused RT1');
+  assert.deepEqual(sessionCookiesIn(stale), []);
+  assert.deepEqual(otherCookieNamesIn(stale), otherCookieNamesIn(unwrapped), 'other cookies pass through');
+  assert.equal(stale.headers.get('content-type'), unwrapped.headers.get('content-type'));
+  browser.receive(stale);
+  assert.equal(browser.signedIn, true);
+  assert.equal((await browser.token())?.refreshToken, rt2);
+
+  // The admin wrapper and Proxy deny the same old request, consistently.
+  const admin = await upload(load, rt1Cookie);
+  assert.equal(admin.response.status, 401);
+  assert.equal(admin.puts, 0);
+  assert.deepEqual(admin.response.headers.getSetCookie(), []);
+  const proxied = await createAdminProxy(load)(csrfRequest(rt1Cookie));
+  assert.equal(proxied.status, 401);
+  assert.deepEqual(proxied.headers.getSetCookie(), []);
+  browser.receive(admin.response);
+  browser.receive(proxied);
+
+  // The RT2 session itself is served and re-issued by the native route.
+  const current = browser.receive(await route(sessionRequest(browser.cookie)));
+  assert.deepEqual((await sessionBody(current))?.user?.groups, ['auraplex-uploader']);
+  assert.equal((await reissued(current.headers.getSetCookie()))?.refreshToken, rt2);
+  assert.equal((await browser.token())?.refreshToken, rt2);
+});
+
+test('native /api/auth/session: when the current login ends, its cookie is cleared', async () => {
+  const cases: Array<{ name: string; arrange: (env: Env) => Promise<string> | string }> = [
+    { name: 'idle expiry', arrange: async (env) => { const login = await env.signIn('browser-a'); env.clock.now += IDLE; return login.header; } },
+    { name: '12-hour expiry', arrange: async (env) => { const login = await env.signIn('browser-a'); env.clock.now += ABSOLUTE; return login.header; } },
+    {
+      name: 'Keycloak revocation',
+      arrange: async (env) => { const login = await env.signIn('browser-a'); env.clock.now += WINDOW; env.kc.disable(KC_SUB); return login.header; },
+    },
+    {
+      name: 'refresh succeeded but the 12-hour limit passed',
+      arrange: async (env) => {
+        const login = await env.cookie({ loginAt: sec(env.clock.now - ABSOLUTE + 2 * SECOND) });
+        env.kc.duringTokenRequest = () => { env.clock.now += 3 * SECOND; };
+        return login.header;
+      },
+    },
+  ];
+  for (const { name, arrange } of cases) {
+    const env = await setup(T0 + 20 * HOUR);
+    const browser = browserWith(await arrange(env));
+    const ended = await authRouteOf(env)(sessionRequest(browser.cookie));
+    assert.equal(await sessionBody(ended), null, name);
+    assert.ok(clearsSession(ended.headers.getSetCookie()), `${name}: the removal is sent`);
+    browser.receive(ended);
+    assert.equal(browser.signedIn, false, name);
+  }
+});
+
+test('native /api/auth/signout: a delayed sign-out of an old login does not delete the newer login', async () => {
+  // Unfiltered, Auth.js removes the session cookie for any sign-out.
+  const control = await setup();
+  const controlOld = await control.signIn('browser-a');
+  await control.signIn('browser-a');
+  const unwrapped = await control.handlers.POST(await signOutRequest(authRouteOf(control), controlOld.header));
+  assert.ok(clearsSession(unwrapped.headers.getSetCookie()));
+
+  const env = await setup();
+  const route = authRouteOf(env);
+  const oldLogin = await env.signIn('browser-a');
+  const newLogin = await env.signIn('browser-a');
+  const browser = browserWith(newLogin.header);
+  const newLineage = lineageOf(await browser.token());
+
+  // The old login's sign-out is handled only now.
+  const late = await route(await signOutRequest(route, oldLogin.header));
+  assert.equal(late.status, unwrapped.status, 'the request completes as it would have');
+  assert.equal(late.headers.get('location'), unwrapped.headers.get('location'));
+  assert.deepEqual(sessionCookiesIn(late), []);
+  assert.deepEqual(otherCookieNamesIn(late), otherCookieNamesIn(unwrapped), 'other Auth.js cookies are kept');
+  browser.receive(late);
+  assert.equal(browser.signedIn, true);
+  assert.equal((await browser.token())?.loginId, newLogin.loginId);
+  assert.equal(env.singleFlight.isCurrentLogin(newLineage), true, 'the new login was not retired');
+  assert.ok((await sessionBody(await route(sessionRequest(browser.cookie))))?.user);
+});
+
+test('native /api/auth/signout: signing out of the current login clears it and keeps the browser instance', async () => {
+  const env = await setup();
+  const route = authRouteOf(env);
+  const login = await env.signIn('browser-a');
+  const browser = browserWith(login.header);
+  const lineage = lineageOf(await browser.token());
+
+  const signedOut = await route(await signOutRequest(route, browser.cookie));
+  assert.ok(signedOut.status < 400);
+  assert.ok(clearsSession(signedOut.headers.getSetCookie()));
+  assert.equal(
+    signedOut.headers.getSetCookie().some((value) => value.startsWith(browserInstanceCookieName(false))),
+    false,
+    'the browser-instance cookie is not touched by sign-out',
+  );
+  browser.receive(signedOut);
+  assert.equal(browser.signedIn, false);
+  assert.equal(env.singleFlight.isCurrentLogin(lineage), false);
+
+  // A repeated, late sign-out of that login after the next sign-in is ignored.
+  const next = await env.signIn('browser-a');
+  browser.set(next.header);
+  browser.receive(await route(await signOutRequest(route, login.header)));
+  assert.equal((await browser.token())?.loginId, next.loginId);
+});
+
+test('native /api/auth/session: a late success of the old login does not replace the new login', async () => {
+  const env = await setup();
+  const route = authRouteOf(env);
+  const oldLogin = await env.signIn('browser-a');
+  env.clock.now += WINDOW;
+  const newLogin = await env.signIn('browser-a');
+  const browser = browserWith(newLogin.header);
+
+  const unwrapped = await env.handlers.GET(sessionRequest(oldLogin.header));
+  assert.equal((await reissued(unwrapped.headers.getSetCookie()))?.loginId, oldLogin.loginId, 'unfiltered, it re-issues the old login');
+
+  const late = await route(sessionRequest(oldLogin.header));
+  assert.ok((await sessionBody(late))?.user, "the old request's own answer is unchanged");
+  assert.deepEqual(sessionCookiesIn(late), []);
+  browser.receive(late);
+  assert.equal((await browser.token())?.loginId, newLogin.loginId);
+  assert.equal((await browser.token())?.refreshToken, newLogin.refreshToken);
+});
+
+test('native routes: two browsers of the same Keycloak user stay independent', async () => {
+  const env = await setup();
+  const route = authRouteOf(env);
+  const a1 = await env.signIn('browser-a');
+  const b1 = await env.signIn('browser-b');
+  const browserB = browserWith(b1.header);
+  env.clock.now += WINDOW;
+  const a2 = await env.signIn('browser-a');
+  const browserA = browserWith(a2.header);
+
+  // B keeps being served and re-issued although A signed in again.
+  const servedB = browserB.receive(await route(sessionRequest(browserB.cookie)));
+  assert.ok((await sessionBody(servedB))?.user);
+  assert.equal((await reissued(servedB.headers.getSetCookie()))?.loginId, b1.loginId);
+  assert.equal((await browserB.token())?.refreshGeneration, 1);
+
+  // A's old login: neither its session read nor its sign-out touches A's new cookie.
+  browserA.receive(await route(sessionRequest(a1.header)));
+  browserA.receive(await route(await signOutRequest(route, a1.header)));
+  assert.equal((await browserA.token())?.loginId, a2.loginId);
+  assert.ok((await sessionBody(await route(sessionRequest(browserB.cookie))))?.user, 'B is unaffected');
+
+  // B signs out: only B is cleared.
+  browserB.receive(await route(await signOutRequest(route, browserB.cookie)));
+  assert.equal(browserB.signedIn, false);
+  assert.ok((await sessionBody(browserA.receive(await route(sessionRequest(browserA.cookie)))))?.user);
+  assert.equal((await browserA.token())?.loginId, a2.loginId);
+});
+
+test('the route wrapper removes only the session cookie and passes everything else through', async () => {
+  const env = await setup();
+  const lineage: SessionLineage = { browserInstanceId: 'browser-x', loginId: 'login-x', refreshGeneration: 1 };
+  const cookies = [
+    `${COOKIE}=; Path=/; Max-Age=0; HttpOnly`,
+    `${COOKIE}.0=; Path=/; Max-Age=0; HttpOnly`,
+    `${COOKIE}.1=chunk; Path=/; HttpOnly`,
+    'authjs.csrf-token=csrf; Path=/; HttpOnly',
+    'authjs.callback-url=url; Path=/',
+    'authjs.pkce.code_verifier=pkce; Path=/; Max-Age=900',
+    'authjs.state=state; Path=/; Max-Age=900',
+    'authjs.nonce=nonce; Path=/; Max-Age=900',
+    `${COOKIE}-lookalike=kept; Path=/`,
+    `${browserInstanceCookieName(false)}=11111111-2222-3333-4444-555555555555; Path=/; HttpOnly`,
+  ];
+  const handlerReporting = (outcome: AdminAuthScope['outcome']) => async () => {
+    const scope = currentAdminAuthScope();
+    if (scope && outcome) scope.outcome = outcome;
+    const response = new Response('{"body":"kept"}', { status: 418, statusText: 'kept', headers: { 'content-type': 'application/json', 'x-kept': 'yes' } });
+    for (const cookie of cookies) response.headers.append('set-cookie', cookie);
+    return response;
+  };
+  const request = () => new Request('http://admin.example.test/api/auth/session', { headers: headersFor() });
+  const options = { production: false, ordering: env.singleFlight };
+
+  const filtered = await withBrowserInstance(
+    request(),
+    handlerReporting({ status: 'ended', reason: 'provider-superseded-refresh-rejected', lineage }),
+    options,
+  );
+  assert.deepEqual(filtered.headers.getSetCookie(), cookies.slice(3), 'session cookie and its chunks only');
+  assert.equal(filtered.status, 418);
+  assert.equal(filtered.statusText, 'kept');
+  assert.equal(filtered.headers.get('x-kept'), 'yes');
+  assert.equal(filtered.headers.get('content-type'), 'application/json');
+  assert.equal(await filtered.text(), '{"body":"kept"}');
+
+  // Nothing reported, or a current session: the response is passed through as is.
+  for (const outcome of [undefined, { status: 'active', lineage } as const, { status: 'ended', reason: 'local-idle-expired', lineage } as const]) {
+    const untouched = await withBrowserInstance(request(), handlerReporting(outcome), options);
+    assert.deepEqual(untouched.headers.getSetCookie(), cookies);
+  }
+  // A sign-out is filtered only when the browser had already left that login.
+  for (const wasCurrentLogin of [true, false]) {
+    const signedOut = await withBrowserInstance(request(), handlerReporting({ status: 'signed-out', lineage, wasCurrentLogin }), options);
+    assert.deepEqual(signedOut.headers.getSetCookie(), wasCurrentLogin ? cookies : cookies.slice(3));
+  }
+
+  // Real handlers: the CSRF cookie of /api/auth/csrf comes through, and a read
+  // that could not be revalidated leaves the session cookie exactly as it is.
+  const route = authRouteOf(env);
+  const csrf = await route(new NextRequest('http://admin.example.test/api/auth/csrf', { headers: headersFor() }));
+  assert.ok(csrf.headers.getSetCookie().some((value) => value.startsWith('authjs.csrf-token=')));
+  const { header } = await env.cookie();
+  env.kc.mode = 'network';
+  const unavailable = await route(sessionRequest(header));
+  assert.deepEqual(sessionCookiesIn(unavailable), []);
+  assert.deepEqual(Object.keys((await sessionBody(unavailable)) ?? {}).sort(), ['expires', REVALIDATION_UNAVAILABLE_FLAG]);
+});
+
+// --- Documented limitation: network arrival order ----------------------------
+
+test('limitation: the server orders what it commits, not the order in which responses reach the browser', async () => {
+  const { clock, kc, load, cookie, singleFlight } = await setup();
+  const login = await cookie({ validatedAgo: 0 });
+  const browser = browserWith(login.header);
+
+  // Two requests, handled and committed strictly one after the other. Each
+  // cookie is current at the moment the server commits it.
+  const first = await visit(load, browser.cookie);
+  assert.equal((await reissued(first.headers.getSetCookie()))?.refreshGeneration, 0);
+  clock.now += WINDOW;
+  const second = await visit(load, browser.cookie);
+  assert.equal((await reissued(second.headers.getSetCookie()))?.refreshGeneration, 1);
+
+  // The network delivers them the other way round. Nothing on the server can
+  // see or prevent this: the browser applies the older cookie last.
+  browser.receive(second);
+  browser.receive(first);
+  assert.equal((await browser.token())?.refreshGeneration, 0, 'the browser is back on the consumed generation');
+  assert.equal(singleFlight.isSuperseded(lineageOf(await browser.token())), true);
+
+  // Consequence: once that cookie is due for revalidation, Keycloak refuses
+  // the consumed token and the user has to sign in again.
+  clock.now += WINDOW;
+  const denied = browser.receive(await visit(load, browser.cookie));
+  assert.equal(denied.status, 401);
+  assert.equal(kc.presented.at(-1), login.refreshToken);
+});
+
+// --- Coordinator ------------------------------------------------------------
+
+test('concurrent requests of the same generation still share one refresh and all commit it', async () => {
+  const { clock, kc, load, cookie, singleFlight } = await setup();
+  const login = await cookie();
+  const browser = browserWith(login.header);
+  browser.receive(await visit(load, browser.cookie));
+  const rt1 = (await browser.token())?.refreshToken;
+  assert.deepEqual(singleFlight.ordering, { logins: 1, browsers: 0 });
+
+  clock.now += WINDOW;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  kc.duringTokenRequest = () => gate;
+  const pending = Array.from({ length: 6 }, () => visit(load, browser.cookie));
+  while (kc.calls.token === 1) await new Promise((resolve) => setImmediate(resolve));
+  for (let turn = 0; turn < 50; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(singleFlight.size.inFlight, 1);
+  release();
+  const responses = await Promise.all(pending);
+
+  assert.deepEqual(kc.presented, [login.refreshToken, rt1], 'one refresh for six requests');
+  const committed = new Set<unknown>();
+  for (const response of responses) {
+    assert.equal(response.status, 200);
+    const token = await reissued(response.headers.getSetCookie());
+    assert.equal(token?.refreshGeneration, 2);
+    committed.add(token?.refreshToken);
+  }
+  assert.equal(committed.size, 1, 'every response commits the same new generation');
+  assert.equal(committed.has(rt1), false);
+  assert.equal(committed.has(undefined), false, 'none of them is treated as stale');
+  assert.equal(singleFlight.size.inFlight, 0);
+  assert.deepEqual(singleFlight.ordering, { logins: 1, browsers: 0 }, 'one entry per login, not per rotation');
+});
+
+test('a failed refresh leaves no coordinator entry and does not block the next one', async () => {
+  const { kc, load, cookie, singleFlight } = await setup();
+  const login = await cookie();
+
+  for (const mode of ['network', 'timeout', 'http-5xx'] as const) {
+    kc.mode = mode;
+    const failed = await visit(load, login.header);
+    assert.equal(failed.status, 503, mode);
+    assert.deepEqual(failed.headers.getSetCookie(), []);
+    assert.deepEqual(singleFlight.size, { inFlight: 0, settled: 0 }, mode);
+    assert.deepEqual(singleFlight.ordering, { logins: 0, browsers: 0 }, mode);
+  }
+
+  // Keycloak is back: the same cookie refreshes normally and is committed.
+  kc.mode = 'ok';
+  const ok = await visit(load, login.header);
+  assert.equal(ok.status, 200);
+  assert.ok(nextCookie(ok.headers.getSetCookie()));
+  assert.deepEqual(singleFlight.ordering, { logins: 1, browsers: 0 });
+
+  // A revoked grant records nothing either, and still clears the session.
+  const other = await setup();
+  const revoked = await other.cookie();
+  other.kc.disable(KC_SUB);
+  const ended = await visit(other.load, revoked.header);
+  assert.equal(ended.status, 401);
+  assert.ok(clearsSession(ended.headers.getSetCookie()));
+  assert.deepEqual(other.singleFlight.size, { inFlight: 0, settled: 0 });
+  assert.deepEqual(other.singleFlight.ordering, { logins: 0, browsers: 0 });
+
+  // A refresh that throws is cleaned up as well and can be retried.
+  const flight = new RefreshSingleFlight();
+  await assert.rejects(flight.run('k', () => 0, async () => { throw new Error('boom'); }), /boom/);
+  assert.deepEqual(flight.size, { inFlight: 0, settled: 0 });
+  assert.deepEqual(flight.ordering, { logins: 0, browsers: 0 });
+  const retried = await flight.run('k', () => 0, async () => ({ status: 'revoked' }));
+  assert.deepEqual(retried, { status: 'revoked' });
+});
+
+test('ordering state is capacity bounded, ages out, and does not depend on the reuse window', () => {
+  const retention = 12 * HOUR;
+  const flight = new RefreshSingleFlight(1_000, 2, 3, retention);
+  const at = (loginId: string, refreshGeneration: number, browserInstanceId = 'browser'): SessionLineage =>
+    ({ browserInstanceId, loginId, refreshGeneration });
+
+  // Refresh generations: one entry per login however often it rotates.
+  for (let generation = 0; generation < 10; generation += 1) flight.recordRotation(at('a', generation), 0);
+  assert.deepEqual(flight.ordering, { logins: 1, browsers: 0 });
+  assert.equal(flight.isSuperseded(at('a', 10)), false, 'the current generation');
+  for (const generation of [0, 5, 9]) assert.equal(flight.isSuperseded(at('a', generation)), true);
+  // A rotation reported late does not lower the newest known generation.
+  flight.recordRotation(at('a', 3), 0);
+  assert.equal(flight.isSuperseded(at('a', 9)), true);
+  assert.equal(flight.isSuperseded(at('a', 10)), false);
+  // Another login is its own lineage, and an unknown one is never stale.
+  flight.recordRotation(at('b', 0), 0);
+  assert.equal(flight.isSuperseded(at('b', 0)), true);
+  assert.equal(flight.isSuperseded(at('b', 1)), false);
+  assert.equal(flight.isSuperseded(at('never-seen', 0)), false);
+
+  // The answer does not expire with the 1-second reuse window.
+  flight.recordRotation(at('b', 1), retention - 1);
+  assert.equal(flight.isSuperseded(at('a', 9)), true);
+
+  // Capacity: the least recently written login is forgotten, i.e. unknown.
+  flight.recordRotation(at('c', 0), retention - 1);
+  flight.recordRotation(at('d', 0), retention - 1);
+  assert.deepEqual(flight.ordering, { logins: 3, browsers: 0 });
+  assert.equal(flight.isSuperseded(at('a', 9)), false, 'evicted history is unknown, not stale');
+  assert.equal(flight.isSuperseded(at('b', 1)), true);
+
+  // Past the 12-hour session limit nothing of the old logins is kept.
+  flight.recordRotation(at('e', 0), 2 * retention);
+  assert.deepEqual(flight.ordering, { logins: 1, browsers: 0 });
+  assert.equal(flight.isSuperseded(at('b', 1)), false);
+
+  // Browser → current login.
+  const browsers = new RefreshSingleFlight(1_000, 2, 3, retention);
+  assert.equal(browsers.isCurrentLogin(at('l1', 0, 'b1')), true, 'an unknown browser is not known to have moved on');
+  browsers.beginLogin('b1', 'l1', 0);
+  assert.equal(browsers.isCurrentLogin(at('l1', 0, 'b1')), true);
+  browsers.beginLogin('b1', 'l2', 1);
+  assert.equal(browsers.isCurrentLogin(at('l1', 0, 'b1')), false);
+  assert.equal(browsers.isCurrentLogin(at('l2', 0, 'b1')), true);
+  assert.equal(browsers.isCurrentLogin(at('l1', 0, 'b2')), true, 'keyed by browser, not by login or user');
+  // A sign-out of a login the browser already left changes nothing.
+  browsers.endLogin('b1', 'l1', 2);
+  assert.equal(browsers.isCurrentLogin(at('l2', 0, 'b1')), true);
+  browsers.endLogin('b1', 'l2', 3);
+  assert.equal(browsers.isCurrentLogin(at('l2', 0, 'b1')), false);
+  browsers.beginLogin('b1', 'l3', 4);
+  assert.equal(browsers.isCurrentLogin(at('l3', 0, 'b1')), true);
+  assert.deepEqual(browsers.ordering, { logins: 0, browsers: 1 });
+  // Capacity and age.
+  for (const browser of ['b2', 'b3', 'b4']) browsers.beginLogin(browser, `login-of-${browser}`, 5);
+  assert.deepEqual(browsers.ordering, { logins: 0, browsers: 3 });
+  assert.equal(browsers.isCurrentLogin(at('l2', 0, 'b1')), true, 'b1 was evicted: unknown again');
+  browsers.beginLogin('b5', 'l5', 5 + retention);
+  assert.deepEqual(browsers.ordering, { logins: 0, browsers: 1 });
+});
+
+test('Proxy applies the same commit rule when it hands a request on', async () => {
+  const { load, cookie } = await setup();
+  const { header } = await cookie({ validatedAgo: 0 });
+
+  const current = await createAdminProxy(load)(csrfRequest(header));
+  assert.ok(current.headers.get('x-middleware-next'));
+  assert.ok(nextCookie(current.headers.getSetCookie()));
+
+  // The same read, overtaken before Proxy answers: the request is still
+  // allowed, but its cookie is not set.
+  const overtaken = await createAdminProxy(async (headers) => ({ ...(await load(headers)), withholdSessionCookies: () => true }))(csrfRequest(header));
+  assert.ok(overtaken.headers.get('x-middleware-next'));
+  assert.deepEqual(overtaken.headers.getSetCookie(), []);
+});
+
 // --- Interaction with the local 30-minute / 12-hour limits ------------------
 
 test('idle- or absolute-expired sessions are rejected before Keycloak is contacted', async () => {
@@ -672,6 +1782,14 @@ test('sign-in stores revalidation state and keeps keycloakSub separate from toke
   assert.deepEqual([token.loginAt, token.activeAt], [sec(T0), sec(T0)]);
   assert.deepEqual(token.groups, ['auraplex-uploader']);
   assert.equal(JSON.stringify(token).includes('access-token'), false, 'the access token is not kept');
+  // Every sign-in is its own login lineage, starting at refresh generation 0.
+  assert.equal(token.refreshGeneration, 0);
+  assert.match(String(token.loginId), /^[0-9a-f-]{36}$/);
+  assert.match(String(token.browserInstanceId), /^[0-9a-f-]{36}$/);
+  const again = await signIn({ id_token: 'id-token', refresh_token: 'refresh-token' });
+  assert.notEqual(again?.loginId, token.loginId);
+  assert.notEqual(token.loginId, KC_SUB);
+  assert.notEqual(token.browserInstanceId, KC_SUB);
 
   // A sign-in that cannot be revalidated later is not accepted at all.
   assert.equal(await signIn({ id_token: 'id-token' }), null);
@@ -729,7 +1847,7 @@ test('provider tokens never appear in the browser session JSON or in logs', asyn
 
 test('sessions from before revalidation must sign in again', async () => {
   const { kc, load, cookie } = await setup();
-  for (const missing of ['refreshToken', 'keycloakSub', 'lastValidatedAt']) {
+  for (const missing of ['refreshToken', 'keycloakSub', 'lastValidatedAt', 'loginId', 'browserInstanceId', 'refreshGeneration']) {
     // Otherwise valid and recently active, with an allowed cached group.
     const { header } = await cookie({ validatedAgo: 0, [missing]: undefined });
     const loaded = await load(headersFor(header));

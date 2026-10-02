@@ -7,6 +7,7 @@ import {
   appendSetCookies,
   loadAdminSession,
   sealProxyIdentity,
+  sessionCookiesToCommit,
   type AdminSessionLoader,
 } from './lib/admin/server/session';
 
@@ -70,17 +71,20 @@ export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSess
     if (!process.env.AUTH_SECRET) {
       return new NextResponse('Authentication is not configured', { status: 503 });
     }
-    const { session, keycloakSub, setCookies, revalidationUnavailable } = await loadSession(request.headers);
-    if (revalidationUnavailable) return identityProviderUnavailable(pathname);
-    const identity = identityFromSession(session, keycloakSub);
+    const loaded = await loadSession(request.headers);
+    if (loaded.revalidationUnavailable) return identityProviderUnavailable(pathname);
+    const identity = identityFromSession(loaded.session, loaded.keycloakSub);
     const status = identity ? adminGuardStatus(identity.groups) : 401;
     if (!identity || status !== 200) {
-      return appendSetCookies(adminGuardResponse(request, status === 200 ? 401 : status), setCookies);
+      return appendSetCookies(adminGuardResponse(request, status === 200 ? 401 : status), sessionCookiesToCommit(loaded));
     }
     // Always set here, which also discards any client-supplied value.
     const headers = new Headers(request.headers);
     headers.set(PROXY_IDENTITY_HEADER, await sealProxyIdentity(identity));
-    return appendSetCookies(NextResponse.next({ request: { headers } }), setCookies);
+    // Proxy's cookie is fixed when it hands the request on. One that the
+    // browser's session has already moved past by then is not set; what
+    // happens while the page or handler behind Proxy runs is not seen here.
+    return appendSetCookies(NextResponse.next({ request: { headers } }), sessionCookiesToCommit(loaded));
   };
 }
 

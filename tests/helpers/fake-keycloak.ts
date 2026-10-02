@@ -56,6 +56,10 @@ export async function createFakeKeycloak(config: FakeKeycloakConfig) {
     disable(sub: string) {
       users.get(sub)!.enabled = false;
     },
+    /** Ends one Keycloak session: its refresh token is no longer accepted. */
+    revoke(refreshToken: string) {
+      grants.delete(refreshToken);
+    },
     async rotateSigningKey() {
       key = await signingKey(`test-key-${++serial}`);
     },

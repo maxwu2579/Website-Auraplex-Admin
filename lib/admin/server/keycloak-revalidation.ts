@@ -13,6 +13,8 @@ import { createHash } from 'node:crypto';
 import { createLocalJWKSet, errors as joseErrors, jwtVerify, type JSONWebKeySet } from 'jose';
 import { extractKeycloakGroups } from '@/lib/admin/server/authorization';
 import type { KeycloakConfig } from '@/lib/admin/server/config';
+import { ADMIN_SESSION_POLICY } from '@/lib/admin/server/session-policy';
+import type { SessionLineage } from '@/lib/admin/server/session-context';
 
 /** One budget for discovery, JWKS and the token request together. */
 export const KEYCLOAK_REVALIDATION_TIMEOUT_MS = 5_000;
@@ -27,6 +29,16 @@ const PROVIDER_METADATA_TTL_MS = 10 * 60_000;
  */
 export const REFRESH_RESULT_REUSE_MS = 10_000;
 export const REFRESH_STATE_CAPACITY = 256;
+/**
+ * How many logins and how many browser instances are remembered for response
+ * ordering (see RefreshSingleFlight). An entry is an id and two numbers.
+ */
+export const SESSION_ORDERING_CAPACITY = 1024;
+/**
+ * Ordering state is forgotten once no session could still depend on it:
+ * `loginAt` is fixed, so every cookie of a login is rejected after 12 hours.
+ */
+export const SESSION_ORDERING_RETENTION_MS = ADMIN_SESSION_POLICY.absoluteLifetimeSeconds * 1000;
 /**
  * Allowed clock difference between this host and Keycloak when checking an ID
  * token's `exp` and `iat`. A token issued further in the future is rejected.
@@ -59,6 +71,8 @@ export type KeycloakRevalidationResult =
 export interface KeycloakRevalidationInput {
   refreshToken: string;
   keycloakSub: string;
+  /** Where this refresh token sits in its login; recorded when it is rotated. */
+  lineage?: SessionLineage;
 }
 
 export type KeycloakRevalidator = (input: KeycloakRevalidationInput) => Promise<KeycloakRevalidationResult>;
@@ -67,6 +81,7 @@ export type KeycloakRevalidator = (input: KeycloakRevalidationInput) => Promise<
 export interface KeycloakSessionState extends KeycloakRevalidationInput {
   lastValidatedAt: number;
   refreshExpiresAt?: number;
+  lineage: SessionLineage;
 }
 
 function nonEmptyString(value: unknown): string | null {
@@ -78,15 +93,30 @@ function positiveNumber(value: unknown): number | null {
 }
 
 /**
- * Returns null for sessions issued before revalidation existed (or otherwise
- * incomplete): they cannot be revalidated, so they must sign in again.
+ * The ordering claims of a session token: which browser instance and login it
+ * belongs to and how many times that login's refresh token has been rotated.
+ */
+export function readSessionLineage(token: Record<string, unknown>): SessionLineage | null {
+  const browserInstanceId = nonEmptyString(token.browserInstanceId);
+  const loginId = nonEmptyString(token.loginId);
+  const refreshGeneration = token.refreshGeneration;
+  if (!browserInstanceId || !loginId) return null;
+  if (typeof refreshGeneration !== 'number' || !Number.isSafeInteger(refreshGeneration) || refreshGeneration < 0) return null;
+  return { browserInstanceId, loginId, refreshGeneration };
+}
+
+/**
+ * Returns null for sessions issued before revalidation and response ordering
+ * existed (or otherwise incomplete): they cannot be revalidated or ordered, so
+ * they must sign in again.
  */
 export function readKeycloakSessionState(token: Record<string, unknown>): KeycloakSessionState | null {
   const refreshToken = nonEmptyString(token.refreshToken);
   const keycloakSub = nonEmptyString(token.keycloakSub);
   const lastValidatedAt = positiveNumber(token.lastValidatedAt);
-  if (!refreshToken || !keycloakSub || lastValidatedAt === null) return null;
-  return { refreshToken, keycloakSub, lastValidatedAt, refreshExpiresAt: positiveNumber(token.refreshExpiresAt) ?? undefined };
+  const lineage = readSessionLineage(token);
+  if (!refreshToken || !keycloakSub || lastValidatedAt === null || !lineage) return null;
+  return { refreshToken, keycloakSub, lastValidatedAt, refreshExpiresAt: positiveNumber(token.refreshExpiresAt) ?? undefined, lineage };
 }
 
 /**
@@ -95,16 +125,36 @@ export function readKeycloakSessionState(token: Record<string, unknown>): Keyclo
  * REFRESH_RESULT_REUSE_MS. Entries are keyed by a SHA-256 digest, never the raw
  * token; both maps are capped and in-flight entries are removed on completion.
  *
+ * It also keeps what is needed to order responses (see sessionCookiesToCommit
+ * in session.ts), none of which is ever used to accept a request:
+ *
+ * - per login, the highest refresh generation known to exist. The generation
+ *   number travels in the session token; a token whose generation is lower has
+ *   a refresh token that was already redeemed.
+ * - per browser instance, the login that is current there. A sign-in replaces
+ *   it and a sign-out retires it, so a response of an earlier login can be
+ *   told apart from the browser's present session.
+ *
+ * Both are capped, least recently written first out, and dropped after the
+ * 12-hour session limit. A login or browser that is not remembered is treated
+ * as current, which is the behaviour without this record.
+ *
  * This assumes a single Node.js instance. A second instance would not see this
  * state and would redeem an already-rotated refresh token.
  */
 export class RefreshSingleFlight {
   private readonly inFlight = new Map<string, Promise<KeycloakRevalidationResult>>();
   private readonly settled = new Map<string, { result: KeycloakRevalidationResult; expiresAt: number }>();
+  /** loginId → highest refresh generation issued. Oldest write first. */
+  private readonly logins = new Map<string, { latestGeneration: number; writtenAt: number }>();
+  /** browserInstanceId → its current login (null after sign-out). */
+  private readonly browsers = new Map<string, { loginId: string | null; writtenAt: number }>();
 
   constructor(
     private readonly reuseMs = REFRESH_RESULT_REUSE_MS,
     private readonly capacity = REFRESH_STATE_CAPACITY,
+    private readonly orderingCapacity = SESSION_ORDERING_CAPACITY,
+    private readonly orderingRetentionMs = SESSION_ORDERING_RETENTION_MS,
   ) {}
 
   run(
@@ -143,9 +193,67 @@ export class RefreshSingleFlight {
     this.settled.set(key, { result, expiresAt: nowMs + this.reuseMs });
   }
 
+  private write<V extends { writtenAt: number }>(map: Map<string, V>, key: string, value: V): void {
+    for (const [existing, entry] of map) {
+      if (value.writtenAt - entry.writtenAt >= this.orderingRetentionMs) map.delete(existing);
+    }
+    map.delete(key);
+    map.set(key, value);
+    while (map.size > Math.max(this.orderingCapacity, 1)) map.delete(map.keys().next().value as string);
+  }
+
+  /**
+   * Records that the refresh token of `redeemed` was exchanged for the next
+   * generation of the same login. Called only for a successful, verified
+   * rotation, so a failed refresh leaves nothing behind.
+   */
+  recordRotation(redeemed: SessionLineage, nowMs: number): void {
+    const latestGeneration = Math.max(this.logins.get(redeemed.loginId)?.latestGeneration ?? 0, redeemed.refreshGeneration + 1);
+    this.write(this.logins, redeemed.loginId, { latestGeneration, writtenAt: nowMs });
+  }
+
+  /**
+   * True when a newer refresh generation of the same login is known, i.e. this
+   * one's refresh token has already been redeemed. Does not depend on the
+   * clock; an unknown login is not superseded.
+   */
+  isSuperseded({ loginId, refreshGeneration }: SessionLineage): boolean {
+    const login = this.logins.get(loginId);
+    return login !== undefined && refreshGeneration < login.latestGeneration;
+  }
+
+  /** A sign-in: `loginId` becomes the current login of that browser instance. */
+  beginLogin(browserInstanceId: string, loginId: string, nowMs: number): void {
+    this.write(this.browsers, browserInstanceId, { loginId, writtenAt: nowMs });
+  }
+
+  /**
+   * A sign-out: the browser instance has no current login until the next
+   * sign-in. Ignored when the browser has already moved on to another login.
+   */
+  endLogin(browserInstanceId: string, loginId: string, nowMs: number): void {
+    const browser = this.browsers.get(browserInstanceId);
+    if (browser && browser.loginId !== loginId) return;
+    this.write(this.browsers, browserInstanceId, { loginId: null, writtenAt: nowMs });
+  }
+
+  /**
+   * False when the browser instance is known to have signed out of this login
+   * or to have signed in again since. An unknown browser counts as current.
+   */
+  isCurrentLogin({ browserInstanceId, loginId }: SessionLineage): boolean {
+    const browser = this.browsers.get(browserInstanceId);
+    return browser === undefined || browser.loginId === loginId;
+  }
+
   /** Entries currently held, for tests and diagnostics. */
   get size(): { inFlight: number; settled: number } {
     return { inFlight: this.inFlight.size, settled: this.settled.size };
+  }
+
+  /** Remembered ordering entries, for tests and diagnostics. */
+  get ordering(): { logins: number; browsers: number } {
+    return { logins: this.logins.size, browsers: this.browsers.size };
   }
 }
 
@@ -339,5 +447,11 @@ export function createKeycloakRevalidator({
     }
   }
 
-  return (input) => singleFlight.run(refreshStateKey(input), now, () => refresh(input));
+  return (input) => singleFlight.run(refreshStateKey(input), now, async () => {
+    const result = await refresh(input);
+    // Recorded before any request can see the result, so the redeemed
+    // generation is known to be superseded from the moment it is.
+    if (result.status === 'ok' && input.lineage) singleFlight.recordRotation(input.lineage, now());
+    return result;
+  });
 }

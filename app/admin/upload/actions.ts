@@ -5,6 +5,7 @@ import { redirect } from 'next/navigation';
 import { getToken } from 'next-auth/jwt';
 import { signOut } from '@/auth';
 import { authSessionCookieName } from '@/lib/admin/server/auth-cookies';
+import { readSessionLineage, sharedRefreshSingleFlight } from '@/lib/admin/server/keycloak-revalidation';
 import { tryDiscoverKeycloakLogoutUrl } from '@/lib/admin/server/keycloak-logout';
 
 export async function logoutFromKeycloak(): Promise<void> {
@@ -18,6 +19,10 @@ export async function logoutFromKeycloak(): Promise<void> {
   const endSessionUrl = await tryDiscoverKeycloakLogoutUrl(
     typeof token?.idToken === 'string' ? token.idToken : undefined,
   );
-  await signOut({ redirect: false });
+  // A logout submitted from a login this browser has since left (signed out,
+  // or signed in again) must not remove the newer session cookie. The
+  // Keycloak session of the submitted login is still ended below.
+  const lineage = token ? readSessionLineage(token) : null;
+  if (!lineage || sharedRefreshSingleFlight().isCurrentLogin(lineage)) await signOut({ redirect: false });
   redirect(endSessionUrl ?? '/en');
 }
