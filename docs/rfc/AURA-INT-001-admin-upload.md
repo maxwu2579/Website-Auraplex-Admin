@@ -97,7 +97,7 @@ The admin UI lives outside the locale-prefixed public site and does not render t
 
 Proxy is only a first-line check. Every admin handler (`GET /api/admin/csrf`, and `PUT`, `GET`, `DELETE /api/admin/uploads`) independently:
 
-- validates the Auth.js session, including the idle/absolute lifetime rules, and returns the re-issued or cleared session cookie;
+- validates the Auth.js session, including the idle/absolute lifetime rules and the 60-second Keycloak revalidation, and returns the re-issued or cleared session cookie;
 - authorises Keycloak groups;
 - calls `assertAdminNodeRuntime()` and fails closed under the Edge runtime.
 
@@ -119,8 +119,20 @@ Group names are exact, case-insensitive matches against the ID-token `groups` cl
 - **30-minute idle and 12-hour absolute lifetime.** The encrypted Auth.js JWT records a fixed `loginAt` and an `activeAt`. Each authenticated admin request re-issues the cookie with a new `activeAt`; `loginAt` never changes. A session is rejected after 30 minutes without such a request, or 12 hours after `loginAt`. Rules live in `lib/admin/server/session-policy.ts` and are applied in the Auth.js `jwt` callback; Proxy, Route Handlers and the admin page read the session through the same loader (`lib/admin/server/session.ts`).
 - Activity is recorded when a request starts, so an upload that takes longer than 30 minutes completes, but the next request requires signing in again.
 - Expired page requests redirect to sign-in; expired API requests return `401 UNAUTHENTICATED` and clear the cookie. Authenticated users without an allowed group receive `403 FORBIDDEN`.
-- These are application sessions. Keycloak's own SSO Session Idle/Max must be aligned separately if the requirement also applies to the SSO session.
-- JWT sessions cannot be revoked server-side; a copied cookie stays valid until it expires under these rules.
+- These are application sessions on top of the Keycloak SSO session. The local 12-hour limit is an upper bound; Keycloak's confirmed 10-hour SSO Session Max ends the effective session earlier.
+
+### Keycloak revalidation
+
+Confirmed with Friendy: authorization may rely on cached Keycloak groups for at most **60 seconds** (not a Keycloak call on every request). Confirmed Keycloak settings: access token 5 minutes, SSO Session Idle 30 minutes, SSO Session Max 10 hours, online refresh token rotated on use with a lifetime that follows the Keycloak session; a single Node.js instance is acceptable for now.
+
+- **Two separate concepts.** Local activity updates `activeAt` and enforces the idle timeout. Authoritative revalidation contacts Keycloak, replaces the groups and updates `lastValidatedAt`. A request served from still-fresh state never moves `lastValidatedAt`. The 60-second window (`KEYCLOAK_REVALIDATION_WINDOW_SECONDS`) is not derived from the token lifespan, the idle timeout or the absolute lifetime.
+- **Token state.** The encrypted Auth.js JWT holds the refresh token, its expiry, the latest ID token (also used for logout), the groups, `keycloakSub` and `lastValidatedAt`. `token.sub` stays the application session's own id (Auth.js generates a new random one at every sign-in); `keycloakSub` is a separate field that every refreshed ID token must match, and it is the stable identity used for upload ownership, rate limits and audit events. It is read on the server from the encrypted JWT and is not in the browser-visible session JSON. Email is never an ownership key. The access token is not stored. None of this is exposed in the session JSON, API responses, logs or audit events.
+- **Order of checks** on every authenticated admin request: local idle/absolute validity, then freshness. When 60 seconds or more have passed, a refresh-token grant must succeed before authorization continues; afterwards the absolute limit is checked again, and `loginAt` is never reset.
+- **Refresh-token grant** (`lib/admin/server/keycloak-revalidation.ts`): the token endpoint and JWKS come from OIDC discovery on the configured issuer and must live under it. The fresh ID token is verified for signature, issuer, audience/client binding (`azp` is required and must be the client when there are several audiences), subject, expiry and `iat` (not more than 30 seconds in the future); its groups replace the stored ones (no union). Rotation is mandatory: the response must carry a new refresh token, which replaces the stored one; a response without one is a protocol failure and the spent token is not kept.
+- **Fail closed.** `invalid_grant` (revoked, expired, ended session, disabled user) clears the session: `401`. Fresh groups without the required group: `403`. Timeout, network failure, 5xx, or a malformed or untrusted response: `503 IDENTITY_PROVIDER_UNAVAILABLE`, with no privileged operation, no fallback to stale groups and no change to `activeAt` or `lastValidatedAt`; the cookie is kept so the request can be retried. A Keycloak outage therefore blocks admin use within 60 seconds.
+- **Concurrency.** A process-local single-flight makes requests with the same refresh state share one Keycloak call, and keeps a successful result eligible for reuse for 10 seconds by requests that still carry the previous cookie. It holds two maps keyed by a digest of the refresh state (in-flight calls and reusable results), each capped at 256 entries, about 512 in total; expired results are never reused but are removed lazily, not at exactly 10 seconds. It uses no Redis or database. **These guarantees hold for one Node.js process only**; more instances need a shared store or sticky routing first.
+- **One decision per request.** Behind Proxy, the page and the CSRF route use the identity Proxy authenticated (forwarded in an encrypted request header that Proxy always overwrites) rather than reading the session a second time, so a request cannot be accepted by Proxy just inside the window and then fail behind it just outside. When revalidation is due and fails, Proxy itself returns the 503 for both API and page paths and sets no cookie.
+- **Centralised.** The check runs in the Auth.js `jwt` callback, so Proxy and the Proxy-bypassed upload handlers get it through the common session loader, and code behind Proxy gets Proxy's result. Sessions issued before this change carry no refresh state and must sign in again.
 
 ### Cookies and CSRF
 
@@ -180,7 +192,7 @@ A single resolver (`qdrantCollectionForSourceKey`) derives the collection from t
 | `safe-filename` | Sanitised filename used in the key |
 | `mime-type` | Canonical MIME type after sniffing |
 | `ingestion-capability` | `supported` or `deferred` |
-| `uploaded-by` | URI-encoded Keycloak subject; drives the Uploader view |
+| `uploaded-by` | URI-encoded Keycloak subject (`keycloakSub`), stable across logins; drives the Uploader view. Objects written before this was fixed hold a per-login Auth.js UUID instead and are not migrated |
 
 ## File Types and Ingestion Capability
 
@@ -230,7 +242,7 @@ Errors use one shape, `{ "ok": false, "code": "…", "error": "…" }`, with no 
 
 ### `GET /api/admin/uploads`
 
-Returns `{ ok: true, uploads: RecentUpload[], qdrantAvailable }` with up to 50 recent uploads across the three buckets. Uploaders see only objects whose `uploaded-by` matches their subject; Admins see all. Because ownership is in object metadata, the listing checks metadata newest-first in batches of 25 until 50 matching objects are found, so other users' newer uploads cannot hide an uploader's own objects. If Qdrant is not configured, `qdrantAvailable` is `false` and PDFs stay `pending`; a Qdrant query error fails the request rather than reporting a false result.
+Returns `{ ok: true, uploads: RecentUpload[], qdrantAvailable }` with up to 50 recent uploads across the three buckets. Uploaders see only objects whose `uploaded-by` matches their Keycloak subject; Admins see all. Legacy objects whose `uploaded-by` is an old per-login UUID match no uploader and are visible to Admins only. Because ownership is in object metadata, the listing checks metadata newest-first in batches of 25 until 50 matching objects are found, so other users' newer uploads cannot hide an uploader's own objects. If Qdrant is not configured, `qdrantAvailable` is `false` and PDFs stay `pending`; a Qdrant query error fails the request rather than reporting a false result.
 
 ### `DELETE /api/admin/uploads`
 
@@ -327,13 +339,13 @@ Route Handlers use Next's Node.js default runtime (Next 16 with Cache Components
 
 ## Dependencies
 
-Added: `next-auth` 5 (beta), `@aws-sdk/client-s3` 3.1136.0, `@aws-sdk/lib-storage` 3.1136.0 (unknown-length multipart), `@qdrant/js-client-rest` 1.19, `file-type` 19.6.0 (pinned), `react-dropzone` 14.4.1. Installed with npm.
+Added: `jose` (declared directly; already installed through `next-auth`, used to verify refreshed ID tokens), `next-auth` 5 (beta), `@aws-sdk/client-s3` 3.1136.0, `@aws-sdk/lib-storage` 3.1136.0 (unknown-length multipart), `@qdrant/js-client-rest` 1.19, `file-type` 19.6.0 (pinned), `react-dropzone` 14.4.1. Installed with npm.
 
 The 2026-09-24 `npm audit` reports 44 advisory entries (2 critical: `next`, transitive `tar`). No dependency remediation was done in this work; see [`AURA-INT-001-dependency-review.md`](../deployment/AURA-INT-001-dependency-review.md). This is not a production security sign-off.
 
 ## Testing and Validation
 
-Tests use the built-in `node:test` runner with `tsx` (`npm test`); Vitest was not adopted. The suite has 134 tests across seven files:
+Tests use the built-in `node:test` runner with `tsx` (`npm test`); Vitest was not adopted. The suite has 170 tests across eight files:
 
 | File | Coverage |
 | --- | --- |
@@ -341,6 +353,7 @@ Tests use the built-in `node:test` runner with `tsx` (`npm test`); Vitest was no
 | `tests/admin-integration.test.ts` | Upload service with and without Content-Length, no premature success, S3 adapter commands and listing, Qdrant routing and exact `source_key` filter, status mapping and visibility, legacy prefixes, Qdrant-first delete and `PARTIAL_DELETE` |
 | `tests/admin-security.test.ts` | Group mapping, CSRF, rate limiter, audit fields, trusted-IP handling, Proxy matcher and upload bypass, enforcement without Proxy, cookie flags, Keycloak logout discovery and fallback |
 | `tests/admin-session.test.ts` | 30-minute idle / 12-hour absolute limits through the real Auth.js cookie pipeline with an injected clock |
+| `tests/admin-revalidation.test.ts` | 60-second Keycloak revalidation against an in-process fake Keycloak: freshness window, group replacement, `invalid_grant`, outage and untrusted responses, mandatory refresh-token rotation, `iat`/`azp` rules, Proxy → handler pipeline across the 60-second mark, upload ownership across logins, single-flight, local-limit interaction, Proxy/handler consistency, no token exposure |
 | `tests/admin-storage.test.ts` | Real AWS SDK against an in-process S3 endpoint: PutObject vs multipart, abort cleanup, body failure, delayed/failing/hung aborts, failed `CompleteMultipartUpload`, stalled client and stalled MinIO |
 | `tests/admin-upload-limits.test.ts` | Concurrency guard capacity and release on every outcome; rate-limit reserve/settle |
 | `tests/admin-upload-ui.test.tsx` | react-dropzone input and `accept` contract (server-rendered) |
@@ -385,6 +398,7 @@ Resolved during implementation:
 - Qdrant collections `auraplex_machines`, `auraplex_software`, `auraplex_consulting`.
 - DOCX is stored in `auraplex-raw-pdf` as deferred; images and video are stored now as deferred.
 - Admin deletion is in scope, Qdrant first; one MinIO credential covers upload and deletion.
+- Keycloak session settings and the 60-second revalidation window (see [Keycloak revalidation](#keycloak-revalidation)).
 
 Still open (require Friendy, infrastructure or real-environment evidence):
 
@@ -394,7 +408,7 @@ Still open (require Friendy, infrastructure or real-environment evidence):
 4. **MinIO lifecycle rule** for incomplete multipart uploads on all three buckets, with an ops-confirmed duration. **Not confirmed as deployed.**
 5. Whether the ingest worker's `parse_key()` and payload match the confirmed key and `source_key`, and whether `source_key` has an exact-match payload index in each collection.
 6. The MinIO server version accepts lib-storage multipart uploads with the SDK's default CRC32 checksums.
-7. Keycloak issuer, client, redirect and post-logout URI registration, `groups` claim mapping, and SSO Session Idle/Max alignment.
+7. Keycloak issuer, client, redirect and post-logout URI registration and `groups` claim mapping; and real-realm confirmation of revalidation (ID token with `groups` in the refresh response, Basic client authentication, session-cookie size through the ingress), which has only been tested against a fake Keycloak.
 8. Production memory headroom under the default concurrency of 4.
 9. Trusted forwarded-header setup (`ADMIN_TRUSTED_PROXY_SECRET`) and exact production secret paths.
 10. Real catalogue products for the software and consulting lines.

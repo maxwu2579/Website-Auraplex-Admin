@@ -2,7 +2,13 @@ import createMiddleware from 'next-intl/middleware';
 import { NextRequest, NextResponse } from 'next/server';
 import { routing } from './lib/navigation';
 import { canUpload, identityFromSession } from './lib/admin/server/authorization';
-import { appendSetCookies, loadAdminSession, type AdminSessionLoader } from './lib/admin/server/session';
+import {
+  PROXY_IDENTITY_HEADER,
+  appendSetCookies,
+  loadAdminSession,
+  sealProxyIdentity,
+  type AdminSessionLoader,
+} from './lib/admin/server/session';
 
 const localeProxy = createMiddleware(routing);
 
@@ -19,9 +25,8 @@ export function adminGuardStatus(groups: unknown): 200 | 401 | 403 {
   }) ? 200 : 403;
 }
 
-function adminGuardResponse(request: NextRequest, status: 200 | 401 | 403): NextResponse {
+function adminGuardResponse(request: NextRequest, status: 401 | 403): NextResponse {
   const pathname = request.nextUrl.pathname;
-  if (status === 200) return NextResponse.next();
   if (pathname === '/api/admin' || pathname.startsWith('/api/admin/')) {
     return NextResponse.json(
       { ok: false, code: status === 401 ? 'UNAUTHENTICATED' : 'FORBIDDEN', error: 'Access denied' },
@@ -34,11 +39,28 @@ function adminGuardResponse(request: NextRequest, status: 200 | 401 | 403): Next
   return NextResponse.redirect(login);
 }
 
+function identityProviderUnavailable(pathname: string): NextResponse {
+  const headers = { 'Cache-Control': 'no-store' };
+  if (pathname === '/api/admin' || pathname.startsWith('/api/admin/')) {
+    return NextResponse.json(
+      { ok: false, code: 'IDENTITY_PROVIDER_UNAVAILABLE', error: 'Sign-in could not be re-verified; retry shortly' },
+      { status: 503, headers },
+    );
+  }
+  return new NextResponse('Sign-in could not be re-verified; retry shortly', { status: 503, headers });
+}
+
 /**
  * Admin gate. Sessions are read through Auth.js (loadAdminSession), so the
  * 30-minute idle and 12-hour absolute limits are the exact rules the route
  * handlers apply. The re-issued cookie (activity) or its removal (expiry) is
- * attached to every admin response, including redirects and 401s.
+ * attached to every admin response, including redirects and 401s. When the
+ * 60-second Keycloak revalidation is due but Keycloak cannot be reached, the
+ * request is denied with 503 and the cookie is left untouched.
+ *
+ * An allowed request continues with the authenticated identity in an
+ * encrypted request header, so the page or Route Handler behind Proxy uses
+ * this one decision instead of reading the session again a moment later.
  */
 export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSession) {
   return async function proxy(request: NextRequest) {
@@ -48,10 +70,17 @@ export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSess
     if (!process.env.AUTH_SECRET) {
       return new NextResponse('Authentication is not configured', { status: 503 });
     }
-    const { session, setCookies } = await loadSession(request.headers);
-    const identity = identityFromSession(session);
+    const { session, keycloakSub, setCookies, revalidationUnavailable } = await loadSession(request.headers);
+    if (revalidationUnavailable) return identityProviderUnavailable(pathname);
+    const identity = identityFromSession(session, keycloakSub);
     const status = identity ? adminGuardStatus(identity.groups) : 401;
-    return appendSetCookies(adminGuardResponse(request, status), setCookies);
+    if (!identity || status !== 200) {
+      return appendSetCookies(adminGuardResponse(request, status === 200 ? 401 : status), setCookies);
+    }
+    // Always set here, which also discards any client-supplied value.
+    const headers = new Headers(request.headers);
+    headers.set(PROXY_IDENTITY_HEADER, await sealProxyIdentity(identity));
+    return appendSetCookies(NextResponse.next({ request: { headers } }), setCookies);
   };
 }
 

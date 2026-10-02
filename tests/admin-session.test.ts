@@ -6,11 +6,13 @@ import { NextRequest } from 'next/server';
 
 import { createAdminAuthConfig } from '../lib/admin/server/auth-config';
 import { ADMIN_SESSION_POLICY, applyAdminSessionPolicy, evaluateAdminSession } from '../lib/admin/server/session-policy';
-import { createAdminSessionLoader, withAdminRequestSession } from '../lib/admin/server/session';
+import { createAdminSessionLoader, withAdminRequestSession, type AdminSessionLoader } from '../lib/admin/server/session';
 import { authSessionCookieName } from '../lib/admin/server/auth-cookies';
 import { getUploads, putUpload } from '../lib/admin/server/upload-service';
 import { UploadConcurrencyGuard } from '../lib/admin/server/upload-concurrency';
 import { createAdminProxy } from '../proxy';
+import { createKeycloakRevalidator, RefreshSingleFlight } from '../lib/admin/server/keycloak-revalidation';
+import { createFakeKeycloak } from './helpers/fake-keycloak';
 
 // Test-only configuration, read at call time by Proxy and the route helper.
 // node:test runs each test file in its own process.
@@ -31,19 +33,54 @@ const ABSOLUTE = ADMIN_SESSION_POLICY.absoluteLifetimeSeconds * 1000;
 const T0 = Date.UTC(2026, 8, 28, 8, 0, 0);
 const sec = (ms: number) => Math.floor(ms / 1000);
 
+const KEYCLOAK = {
+  issuer: TEST_ENV.KEYCLOAK_ISSUER,
+  clientId: TEST_ENV.KEYCLOAK_CLIENT_ID,
+  clientSecret: TEST_ENV.KEYCLOAK_CLIENT_SECRET,
+};
+const KEYCLOAK_SUB = 'keycloak-user-1';
+// In-process stand-in; sessions older than the 60-second revalidation window
+// are refreshed against it. Revalidation itself is covered in
+// admin-revalidation.test.ts.
+const keycloak = createFakeKeycloak(KEYCLOAK);
+
 /** A real Auth.js instance with this app's config and an injectable clock. */
-function authAt(clock: { now: number }) {
-  const { auth } = NextAuth(createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now: () => clock.now }));
-  return createAdminSessionLoader(auth);
+function authAt(clock: { now: number }): AdminSessionLoader {
+  const now = () => clock.now;
+  const loader = keycloak.then((fake) => {
+    const revalidator = createKeycloakRevalidator({
+      config: KEYCLOAK,
+      fetcher: fake.fetcher(now),
+      now,
+      production: false,
+      singleFlight: new RefreshSingleFlight(),
+    });
+    const { auth } = NextAuth(createAdminAuthConfig({ env: { ...TEST_ENV, NODE_ENV: 'test' }, now, revalidator }));
+    return createAdminSessionLoader(auth);
+  });
+  return async (headers) => (await loader)(headers);
 }
 
+let cookieSerial = 0;
+
 async function sessionCookie(claims: Record<string, unknown>, groups = ['auraplex-uploader']) {
+  // Sessions with timestamps also carry Keycloak refresh state, last validated
+  // at their last activity. Timestamp-less (legacy) tokens get none. Each
+  // cookie is its own Keycloak user, so its groups are independent.
+  const keycloakSub = `${KEYCLOAK_SUB}-${++cookieSerial}`;
+  const refreshState = typeof claims.activeAt === 'number'
+    ? {
+        keycloakSub,
+        refreshToken: (await keycloak).grant(keycloakSub, groups),
+        lastValidatedAt: claims.activeAt,
+      }
+    : {};
   const token = await encode({
     secret: TEST_ENV.AUTH_SECRET,
     salt: COOKIE,
     // Long JWT expiry so only the session policy (not real time) decides.
     maxAge: 30 * 24 * 3600,
-    token: { sub: 'user-1', email: 'user@example.test', groups, ...claims },
+    token: { sub: 'user-1', email: 'user@example.test', groups, ...refreshState, ...claims },
   });
   return `${COOKIE}=${token}`;
 }
@@ -90,8 +127,8 @@ test('Auth.js sign-in callback records the login time from the injected clock', 
   const token = await config.callbacks!.jwt!({
     token: { sub: 'user-1' },
     user: { id: 'user-1' },
-    account: { provider: 'keycloak', type: 'oidc', providerAccountId: 'user-1', id_token: 'id-token' },
-    profile: { groups: ['auraplex-uploader'] },
+    account: { provider: 'keycloak', type: 'oidc', providerAccountId: KEYCLOAK_SUB, id_token: 'id-token', refresh_token: 'refresh-token' },
+    profile: { sub: KEYCLOAK_SUB, groups: ['auraplex-uploader'] },
   } as never);
   assert.ok(token);
   assert.equal(token.loginAt, sec(T0));

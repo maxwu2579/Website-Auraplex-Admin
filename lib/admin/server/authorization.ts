@@ -71,32 +71,37 @@ export function requireUploadPermission(
   return identity;
 }
 
-export function identityFromSession(session: Session | null): AdminIdentity | null {
-  if (!session?.user) return null;
-  const user = session.user as Session['user'] & { id?: string; groups?: string[] };
-  const userId = user.id;
-  if (!userId) return null;
+/**
+ * `userId` is the verified Keycloak subject, which is the same on every login
+ * and therefore the key for upload ownership, rate limits and audit events.
+ * Auth.js's own `session.user.id` (token.sub) is a random id generated at each
+ * sign-in; it identifies the application session only and is not used here.
+ */
+export function identityFromSession(session: Session | null, keycloakSub: string | undefined): AdminIdentity | null {
+  if (!session?.user || !keycloakSub) return null;
+  const user = session.user as Session['user'] & { groups?: string[] };
   return {
-    userId,
+    userId: keycloakSub,
     email: user.email ?? undefined,
     groups: Array.isArray(user.groups) ? user.groups : [],
   };
 }
 
 /**
- * Session identity for the current request (admin page, CSRF route). It uses
- * the same Auth.js session read and 30-minute idle / 12-hour absolute policy
- * as Proxy; Proxy has already persisted the refreshed cookie for these paths.
+ * Session identity for the current request (admin page, CSRF route). These
+ * run behind Proxy, which applied the 30-minute idle / 12-hour absolute policy
+ * and the 60-second Keycloak revalidation, persisted the refreshed cookie and
+ * handed over the identity it authenticated (see proxiedRequestIdentity).
  */
 export async function currentRequestIdentity(): Promise<AdminIdentity | null> {
   // Fail clearly before invoking Auth.js when local/production Keycloak values
   // are absent. This avoids pretending that SSO has been verified.
   getKeycloakConfig();
-  const [{ headers }, { loadAdminSession }] = await Promise.all([
+  const [{ headers }, { proxiedRequestIdentity }] = await Promise.all([
     import('next/headers'),
     import('@/lib/admin/server/session'),
   ]);
-  return identityFromSession((await loadAdminSession(await headers())).session);
+  return proxiedRequestIdentity(await headers());
 }
 
 export async function authenticateAdminRequest(): Promise<AdminIdentity> {
