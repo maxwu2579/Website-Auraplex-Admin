@@ -8,8 +8,9 @@ from Qdrant and lets Admins delete an upload from both systems.
 
 This is a standalone application. It is not the public Auraplex website and
 contains no public marketing pages. The only routes reachable without signing
-in are `/`, which redirects to the protected workspace, and `/signed-out`,
-which is intentionally public so that logout has somewhere to land.
+in are `/`, which redirects to the protected workspace, `/signed-out`, which
+is intentionally public so that logout has somewhere to land, and the
+`/api/health` liveness check.
 
 ## Stack
 
@@ -44,6 +45,10 @@ complete sign-in. Without MinIO configured, uploads return
 | `/api/admin/csrf` | protected | Issues the double-submit CSRF token |
 | `/api/admin/uploads` | protected (`PUT`, `GET`, `DELETE`) | Upload, list and delete |
 | `/api/auth/*` | Auth.js | Sign-in, callback, session, sign-out |
+| `/api/health` | public | Liveness check: `{"status":"ok","service":"auraplex-admin"}` |
+
+`/api/health` reports only that the server process is answering. It reads no
+session and does not contact Keycloak, MinIO or Qdrant.
 
 `proxy.ts` guards `/admin/*` and `/api/admin/*` **except `/api/admin/uploads`**.
 That endpoint is deliberately excluded so large request bodies are streamed
@@ -179,7 +184,10 @@ development use `npm run dev` instead.
 
 ## Deployment prerequisites
 
-Deployment is not configured yet. Before a first production deployment:
+Deployment is not configured yet. The full checklist, including the values
+still to be confirmed and the production smoke tests, is in
+`docs/deployment/AURAPLEX-ADMIN-deployment.md`. In short, before a first
+production deployment:
 
 - Decide the Admin deployment identity: domain, ingress route, job and
   service names, image name and port. `deploy/admin.nomad.hcl.example` is a
@@ -200,6 +208,8 @@ Deployment is not configured yet. Before a first production deployment:
 ## Documentation
 
 - `docs/admin-upload-guide.md` — user guide
+- `docs/deployment/AURAPLEX-ADMIN-deployment.md` — deployment readiness,
+  open confirmations and smoke tests
 - `docs/deployment/AURA-INT-001-runtime.md` — runtime and security behaviour
 - `docs/deployment/AURA-INT-001-dependency-review.md` — dependency audit
 - `docs/deployment/minio-admin-upload-policy.json` — MinIO access policy

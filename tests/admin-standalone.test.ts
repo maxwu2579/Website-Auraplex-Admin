@@ -60,6 +60,7 @@ test('the app contains only the standalone Admin routes', () => {
     'app/api/admin/csrf/route.ts',
     'app/api/admin/uploads/route.ts',
     'app/api/auth/[...nextauth]/route.ts',
+    'app/api/health/route.ts',
     'app/apple-icon.png',
     'app/icon.png',
     'app/layout.tsx',
@@ -192,5 +193,13 @@ test('the deployment example cannot be mistaken for, or overwrite, the public we
   const example = read('deploy', 'admin.nomad.hcl.example');
   assert.doesNotMatch(example, /job\s+"website"|auraplex-website|auraplex\.local\/website|path\s*=\s*"\/en"/);
   assert.match(example, /NOT PRODUCTION-READY/);
-  assert.match(example, /path\s*=\s*"\/signed-out"/);
+  assert.match(example, /path\s*=\s*"\/api\/health"/);
+  // Every deployment identity is still an obvious placeholder.
+  assert.match(example, /job "CHANGE_ME_AURAPLEX_ADMIN_JOB"/);
+  assert.match(example, /name\s*=\s*"CHANGE_ME_AURAPLEX_ADMIN_SERVICE"/);
+  assert.match(example, /image\s*=\s*"CHANGE_ME_AURAPLEX_ADMIN_IMAGE"/);
+  assert.match(example, /datacenters = \["CHANGE_ME_AURAPLEX_ADMIN_DATACENTER"\]/);
+  for (const port of example.matchAll(/\b(?:PORT|port)\s*=\s*"([^"]*)"/g)) {
+    assert.equal(port[1], 'CHANGE_ME_AURAPLEX_ADMIN_PORT');
+  }
 });
