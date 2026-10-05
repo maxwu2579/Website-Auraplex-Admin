@@ -84,7 +84,7 @@ export function UploadPanel({ products, canDelete, serverMaxUploadMb }: Props) {
   const [recentNotice, setRecentNotice] = useState('Checking backend connection…');
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
 
-  // All five business lines are shown even when the catalogue has no products
+  // All five business lines are shown even when the Admin dataset has no products
   // for a line yet; product selection stays mandatory for every upload.
   const filteredProducts = useMemo(
     () => products.filter((product) => product.businessLine === businessLine),

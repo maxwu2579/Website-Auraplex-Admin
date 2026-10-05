@@ -1,7 +1,5 @@
-import type { Category } from '@/lib/catalog';
-
 /**
- * Website/business category chosen by the uploader. This is deliberately
+ * Admin-owned business line chosen by the uploader. This is deliberately
  * separate from the ingest taxonomy used for storage paths and Qdrant.
  */
 export const BUSINESS_LINES = [
@@ -34,11 +32,6 @@ export const BUSINESS_LINE_LABELS: Readonly<Record<BusinessLine, string>> = Obje
   software: 'Software',
   consulting: 'Consulting',
 });
-
-// Every website catalogue category must be a business line. This fails to
-// compile if the catalogue gains a category without a confirmed mapping.
-type AssertCatalogCategoriesAreBusinessLines<T extends BusinessLine> = T;
-export type CatalogBusinessLine = AssertCatalogCategoriesAreBusinessLines<Category>;
 
 export function isBusinessLine(value: string): value is BusinessLine {
   return (BUSINESS_LINES as readonly string[]).includes(value);

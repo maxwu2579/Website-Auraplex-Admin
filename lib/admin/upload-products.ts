@@ -1,27 +1,13 @@
-import { MACHINES } from '@/lib/catalog';
+import { ADMIN_PRODUCTS, type AdminProduct } from '@/lib/admin/admin-products';
 import type { BusinessLine } from '@/lib/admin/upload-domain';
 
-export interface UploadProduct {
-  id: string;
-  name: string;
-  slug: string;
-  businessLine: BusinessLine;
-}
+export type UploadProduct = AdminProduct;
 
 /**
- * Products that may receive uploads. Physical machines come from the website
- * catalogue. Software and consulting have no real catalogue products yet;
- * append their real id/name/slug records here when they exist. Never add
- * placeholder IDs or slugs.
+ * Products that may receive uploads, sourced only from the Admin-owned
+ * dataset in `admin-products.ts`.
  */
-export const UPLOAD_PRODUCTS: readonly UploadProduct[] = Object.freeze(
-  MACHINES.map(({ id, name, slug, category }) => ({
-    id,
-    name,
-    slug,
-    businessLine: category,
-  })),
-);
+export const UPLOAD_PRODUCTS: readonly UploadProduct[] = ADMIN_PRODUCTS;
 
 export function findUploadProduct(productId: string): UploadProduct | undefined {
   return UPLOAD_PRODUCTS.find((product) => product.id === productId);
