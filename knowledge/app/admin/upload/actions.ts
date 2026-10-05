@@ -24,5 +24,5 @@ export async function logoutFromKeycloak(): Promise<void> {
   // Keycloak session of the submitted login is still ended below.
   const lineage = token ? readSessionLineage(token) : null;
   if (!lineage || sharedRefreshSingleFlight().isCurrentLogin(lineage)) await signOut({ redirect: false });
-  redirect(endSessionUrl ?? '/en');
+  redirect(endSessionUrl ?? '/');
 }

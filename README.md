@@ -60,6 +60,13 @@ site reads the local catalogue and the CMS-backed features no-op cleanly.
 > `og/default.png` to supply. Fonts are configured in `styles/fonts.css`
 > (currently Fraunces / JetBrains Mono as licensed stand-ins).
 
+## Knowledge-base upload app
+
+The admin upload workspace for the AI knowledge base (PDF, DOCX, images,
+video → MinIO + Qdrant, Keycloak sign-in) is a separate Next.js app in
+[`knowledge/`](knowledge/README.md), built and deployed as its own image and
+Nomad job. It is no longer part of this website.
+
 ## Audit & roadmap
 
 A full audit and phased remediation plan lives in **`MASTER_PLAN.md`**.

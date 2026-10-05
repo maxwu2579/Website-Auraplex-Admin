@@ -244,7 +244,7 @@ test('proxy includes admin page and direct API paths', () => {
   for (const path of ['/admin', '/admin/upload', '/api/admin/csrf', '/api/admin/uploads']) {
     assert.equal(isProtectedAdminPath(path), true);
   }
-  assert.equal(isProtectedAdminPath('/en'), false);
+  assert.equal(isProtectedAdminPath('/'), false);
   assert.equal(adminGuardStatus(undefined), 401);
   assert.equal(adminGuardStatus(['Viewer']), 403);
   assert.equal(adminGuardStatus(['auraplex-uploader']), 200);
@@ -267,10 +267,12 @@ function proxyRuns(pathname: string): boolean {
 test('streaming upload path bypasses Proxy body cloning; other admin paths do not', () => {
   assert.equal(PROXY_BYPASS_UPLOAD_PATH, '/api/admin/uploads');
   assert.equal(proxyRuns('/api/admin/uploads'), false);
-  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload', '/en']) {
+  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload']) {
     assert.equal(proxyRuns(path), true, path);
   }
   assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);
+  // The public landing page (also the post-logout target) is never gated.
+  assert.equal(proxyRuns('/'), false);
 });
 
 function bypassedUploadRequest(headers: Record<string, string> = {}) {
@@ -375,15 +377,15 @@ test('Keycloak logout URL uses discovery endpoint and server-held ID token hint'
     clientId: 'website',
     idToken: 'server-only-token',
     endpoint: 'https://sso.example.test/realms/auraplex/protocol/openid-connect/logout',
-    postLogoutRedirectUri: 'https://site.example.test/en',
+    postLogoutRedirectUri: 'https://site.example.test/',
   }));
   assert.equal(url.searchParams.get('id_token_hint'), 'server-only-token');
-  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/en');
+  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/');
   assert.throws(() => buildKeycloakLogoutUrl({
     issuer: 'https://sso.example.test/realms/auraplex',
     clientId: 'website', idToken: 'x',
     endpoint: 'https://evil.example.test/logout',
-    postLogoutRedirectUri: 'https://site.example.test/en',
+    postLogoutRedirectUri: 'https://site.example.test/',
   }));
 });
 
@@ -404,7 +406,7 @@ test('Keycloak logout discovers the endpoint instead of hardcoding it', async ()
   ));
   assert.equal(requested, 'https://sso.example.test/realms/auraplex/.well-known/openid-configuration');
   assert.equal(url.searchParams.get('id_token_hint'), 'server-held-token');
-  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/en');
+  assert.equal(url.searchParams.get('post_logout_redirect_uri'), 'https://site.example.test/');
 });
 
 test('Keycloak discovery failure falls back to local-only logout destination', async () => {

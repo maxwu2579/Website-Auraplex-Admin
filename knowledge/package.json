@@ -1,0 +1,42 @@
+{
+  "name": "auraplex-knowledge",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev -p 3100",
+    "build": "next build",
+    "start": "next start -p 3100",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test tests/admin-upload.test.ts tests/admin-integration.test.ts tests/admin-security.test.ts tests/admin-storage.test.ts tests/admin-session.test.ts tests/admin-revalidation.test.ts tests/admin-logout-action.test.ts tests/admin-upload-limits.test.ts tests/admin-upload-ui.test.tsx"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1136.0",
+    "@aws-sdk/lib-storage": "^3.1136.0",
+    "@qdrant/js-client-rest": "^1.19.0",
+    "@radix-ui/react-slot": "^1.1.1",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "file-type": "19.6.0",
+    "jose": "^6.2.12",
+    "lucide-react": "^0.469.0",
+    "next": "16.2.7",
+    "next-auth": "^5.0.0-beta.32",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-dropzone": "^14.4.1",
+    "tailwind-merge": "^2.5.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.17.0",
+    "eslint-config-next": "16.2.7",
+    "postcss": "^8.5.0",
+    "tailwindcss": "^4.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

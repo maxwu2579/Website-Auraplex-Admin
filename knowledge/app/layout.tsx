@@ -24,8 +24,8 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Knowledge Base Upload | Auraplex Admin',
-  description: 'Restricted Auraplex knowledge-base upload workspace.',
+  title: 'Auraplex Knowledge',
+  description: 'Restricted workspace for uploading source material to the Auraplex AI knowledge base.',
   robots: { index: false, follow: false },
 };
 
@@ -35,7 +35,7 @@ export const viewport: Viewport = {
   initialScale: 1,
 };
 
-export default function AdminLayout({ children }: { children: React.ReactNode }) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html
       lang="en"

@@ -9,7 +9,7 @@ const eslintConfig = defineConfig([
   ...nextTs,
   {
     rules: {
-      // Sanity payloads are unknown shapes until codegen is wired up.
+      // Matches the website's lint rules.
       '@typescript-eslint/no-explicit-any': 'off',
       // Modern JSX renders apostrophes/quotes correctly; the rule is noise.
       'react/no-unescaped-entities': 'off',
@@ -25,10 +25,7 @@ const eslintConfig = defineConfig([
     'out/**',
     'build/**',
     'node_modules/**',
-    'public/pagefind/**',
     'next-env.d.ts',
-    // Separate app with its own lint config.
-    'knowledge/**',
   ]),
 ]);
 

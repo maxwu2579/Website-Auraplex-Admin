@@ -1,0 +1,96 @@
+@import 'tailwindcss';
+
+/* ──────────────────────────────────────────────────────────────────────────
+ * Auraplex Knowledge — design tokens
+ *
+ * The subset of the Auraplex website tokens (styles/globals.css there) that
+ * the knowledge upload workspace uses. Keep values in step with the website
+ * so both apps read as one brand.
+ * ────────────────────────────────────────────────────────────────────────── */
+@theme {
+  /* ── Signal — cerulean brand ramp ── */
+  --color-signal-wash:    #e7f3fc;
+  --color-signal-bright:  #4eaae9;
+  --color-signal:         #2796df;
+  --color-signal-strong:  #1b7bc4;
+  --color-signal-deep:    #145e97;
+
+  /* ── Concrete — warm neutral ramp, paper → ink ── */
+  --color-paper:          #f4f6f8;
+  --color-neutral-100:    #e7eaee;
+  --color-neutral-200:    #d2d6db;
+  --color-neutral-300:    #b2b8bf;
+  --color-neutral-400:    #9298a1;
+  --color-neutral-500:    #6e757f;
+  --color-neutral-600:    #545b65;
+  --color-neutral-700:    #3e444d;
+  --color-neutral-800:    #2c3138;
+  --color-ink:            #181b20;
+
+  /* ── Semantic status ── */
+  --color-success:        #4f7d52;
+  --color-warning:        #e8943c;
+  --color-danger:         #c8432f;
+  --color-info:           #2796df;
+
+  /* ── Aliases used by the shared Button primitive ── */
+  --color-signal-hi:      var(--color-signal-bright);
+  --color-steel:          var(--color-neutral-400);
+
+  /* ── Typography ── */
+  --font-display: var(--font-fraunces), Georgia, serif;
+  --font-body:    var(--font-inter), system-ui, sans-serif;
+  --font-mono:    var(--font-jetbrains-mono), 'IBM Plex Mono', ui-monospace, monospace;
+
+  --ease-entrance: cubic-bezier(0.65, 0, 0.35, 1);
+}
+
+html {
+  background: var(--color-ink);
+  color: var(--color-paper);
+  font-family: var(--font-body);
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  min-height: 100dvh;
+  line-height: 1.6;
+}
+
+::selection {
+  background: var(--color-signal);
+  color: var(--color-paper);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-signal-bright);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Signal line under ghost buttons on hover/focus (Button variant="ghost"). */
+.btn-underline {
+  position: relative;
+}
+.btn-underline::after {
+  content: '';
+  position: absolute;
+  left: 1.5rem;
+  right: 1.5rem;
+  bottom: 0.5rem;
+  height: 1px;
+  background: var(--color-signal);
+  transform: scaleX(0);
+  transform-origin: left center;
+  transition: transform 500ms var(--ease-entrance);
+  pointer-events: none;
+}
+.btn-underline:hover::after,
+.btn-underline:focus-visible::after {
+  transform: scaleX(1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-underline::after { transition: none; }
+}
