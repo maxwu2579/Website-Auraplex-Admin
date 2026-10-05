@@ -4,6 +4,7 @@ import { headers } from 'next/headers';
 import { redirect } from 'next/navigation';
 import { getToken } from 'next-auth/jwt';
 import { signOut } from '@/auth';
+import { ADMIN_SIGNED_OUT_PATH } from '@/lib/admin/admin-routes';
 import { authSessionCookieName } from '@/lib/admin/server/auth-cookies';
 import { readSessionLineage, sharedRefreshSingleFlight } from '@/lib/admin/server/keycloak-revalidation';
 import { tryDiscoverKeycloakLogoutUrl } from '@/lib/admin/server/keycloak-logout';
@@ -24,5 +25,5 @@ export async function logoutFromKeycloak(): Promise<void> {
   // Keycloak session of the submitted login is still ended below.
   const lineage = token ? readSessionLineage(token) : null;
   if (!lineage || sharedRefreshSingleFlight().isCurrentLogin(lineage)) await signOut({ redirect: false });
-  redirect(endSessionUrl ?? '/en');
+  redirect(endSessionUrl ?? ADMIN_SIGNED_OUT_PATH);
 }

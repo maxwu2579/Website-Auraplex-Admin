@@ -4,8 +4,7 @@ import { adminFontClassName } from '@/lib/admin/admin-fonts';
 import '@/styles/admin.css';
 
 export const metadata: Metadata = {
-  title: 'Knowledge Base Upload | Auraplex Admin',
-  description: 'Restricted Auraplex knowledge-base upload workspace.',
+  title: 'Signed out | Auraplex Admin',
   robots: { index: false, follow: false },
 };
 
@@ -15,6 +14,6 @@ export const viewport: Viewport = {
   initialScale: 1,
 };
 
-export default function AdminLayout({ children }: { children: React.ReactNode }) {
+export default function SignedOutLayout({ children }: { children: React.ReactNode }) {
   return <AdminDocument fontClassName={adminFontClassName}>{children}</AdminDocument>;
 }

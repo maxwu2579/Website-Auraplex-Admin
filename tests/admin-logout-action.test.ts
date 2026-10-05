@@ -121,7 +121,7 @@ function assertKeycloakLogoutRedirect(redirectedTo: string, idToken: string) {
   assert.deepEqual(Object.fromEntries(url.searchParams), {
     client_id: TEST_ENV.KEYCLOAK_CLIENT_ID,
     id_token_hint: idToken,
-    post_logout_redirect_uri: 'http://admin.example.test/en',
+    post_logout_redirect_uri: 'http://admin.example.test/signed-out',
   });
 }
 
@@ -157,7 +157,7 @@ test('logout action, current login: the session is cleared, the login retired, a
   keycloak.available = false;
   try {
     const fallback = await submitLogout(browser.cookie);
-    assert.equal(fallback.redirectedTo, '/en');
+    assert.equal(fallback.redirectedTo, '/signed-out');
     browser.receive(fallback.response);
     assert.equal(browser.signedIn, false);
     assert.equal(coordinator.isCurrentLogin(second.lineage), false);

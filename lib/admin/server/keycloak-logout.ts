@@ -1,3 +1,4 @@
+import { ADMIN_SIGNED_OUT_PATH } from '@/lib/admin/admin-routes';
 import { getKeycloakConfig, type KeycloakConfig } from '@/lib/admin/server/config';
 
 export interface LogoutDiscovery {
@@ -49,7 +50,7 @@ export async function discoverKeycloakLogoutUrl(
     clientId: config.clientId,
     idToken,
     endpoint: discovery.end_session_endpoint,
-    postLogoutRedirectUri: new URL('/en', appOrigin).toString(),
+    postLogoutRedirectUri: new URL(ADMIN_SIGNED_OUT_PATH, appOrigin).toString(),
   });
 }
 

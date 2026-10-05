@@ -146,7 +146,7 @@ Confirmed with Friendy: authorization may rely on cached Keycloak groups for at 
 
 ### Logout
 
-Logout clears the local Auth.js session. When OIDC discovery of Keycloak's `end_session_endpoint` succeeds (1.5-second timeout) and an ID token is held, the user is redirected through Keycloak with `id_token_hint` to end the SSO session and returned to `AUTH_URL`. If discovery is unavailable or the ID token is missing, local logout still completes and redirects to `/en`, but **the upstream Keycloak SSO session is not guaranteed to be terminated**.
+Logout clears the local Auth.js session. When OIDC discovery of Keycloak's `end_session_endpoint` succeeds (1.5-second timeout) and an ID token is held, the user is redirected through Keycloak with `id_token_hint` to end the SSO session and returned to `/signed-out` on `AUTH_URL`. If discovery is unavailable or the ID token is missing, local logout still completes and redirects to `/signed-out`, but **the upstream Keycloak SSO session is not guaranteed to be terminated**.
 
 ## Business Lines, Object Keys and Qdrant Routing
 

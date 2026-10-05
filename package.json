@@ -10,7 +10,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/admin-upload.test.ts tests/admin-products.test.ts tests/admin-integration.test.ts tests/admin-security.test.ts tests/admin-storage.test.ts tests/admin-session.test.ts tests/admin-revalidation.test.ts tests/admin-logout-action.test.ts tests/admin-upload-limits.test.ts tests/admin-upload-ui.test.tsx",
+    "test": "node --import tsx --test tests/admin-upload.test.ts tests/admin-products.test.ts tests/admin-integration.test.ts tests/admin-security.test.ts tests/admin-storage.test.ts tests/admin-session.test.ts tests/admin-revalidation.test.ts tests/admin-logout-action.test.ts tests/admin-upload-limits.test.ts tests/admin-upload-ui.test.tsx tests/admin-routing.test.tsx",
     "sanity:dev": "sanity dev",
     "sanity:deploy": "sanity deploy",
     "seed": "tsx scripts/seed.ts",
