@@ -267,7 +267,7 @@ function proxyRuns(pathname: string): boolean {
 test('streaming upload path bypasses Proxy body cloning; other admin paths do not', () => {
   assert.equal(PROXY_BYPASS_UPLOAD_PATH, '/api/admin/uploads');
   assert.equal(proxyRuns('/api/admin/uploads'), false);
-  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload', '/en']) {
+  for (const path of ['/api/admin', '/api/admin/csrf', '/admin', '/admin/upload']) {
     assert.equal(proxyRuns(path), true, path);
   }
   assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);

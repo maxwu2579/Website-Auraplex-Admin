@@ -1,0 +1,81 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NOT PRODUCTION-READY — EXAMPLE ONLY. DO NOT `nomad job run` THIS FILE.
+#
+# This is a starting point for the standalone Auraplex Admin job. Its
+# deployment identity has NOT been decided yet (Phase 4): job name, service
+# name, image, port, domain, ingress route, Keycloak client and secret paths.
+# Every such value below is a CHANGE_ME placeholder on purpose.
+#
+# It deliberately does not reuse the public website's identity (its job,
+# service or image names), so applying it can never replace that job. Do not
+# put those names back. The public website also listens on host port 3000 with
+# host networking; the Admin job needs its own port.
+# ─────────────────────────────────────────────────────────────────────────────
+job "CHANGE_ME_admin_job_name" {
+  datacenters = ["CHANGE_ME_datacenter"]
+  type        = "service"
+
+  group "web" {
+    count = 1
+
+    network {
+      mode = "host"
+    }
+
+    restart {
+      attempts = 5
+      interval = "5m"
+      delay    = "15s"
+      mode     = "delay"
+    }
+
+    task "next" {
+      driver = "docker"
+
+      config {
+        image        = "CHANGE_ME_admin_image:CHANGE_ME_tag"
+        network_mode = "host"
+      }
+
+      env {
+        NODE_ENV = "production"
+        PORT     = "CHANGE_ME_admin_port"
+        HOSTNAME = "0.0.0.0"
+        # Admin secrets, AUTH_URL (for Keycloak RP logout), group mapping and
+        # service addresses must be injected via templates + nomadVar. The
+        # production variable path is intentionally not guessed here; see
+        # docs/deployment/AURA-INT-001-runtime.md and .env.example.
+        # Upload size: ADMIN_UPLOAD_MAX_MB is the server-enforced RUNTIME cap
+        # (default 100 MB, range 1-500) and the admin UI follows it without a
+        # rebuild. NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB is an optional build-time
+        # UI-only ceiling; leave it unset unless the UI must stay lower.
+        # ADMIN_UPLOAD_MAX_CONCURRENT (default 4, range 1-16) caps concurrent
+        # uploads PER ALLOCATION/PROCESS, sized for the 1024 MB memory below;
+        # it is not a cluster-wide limit.
+      }
+
+      resources {
+        cpu    = 1000
+        memory = 1024
+      }
+    }
+
+    service {
+      name     = "CHANGE_ME_admin_service_name"
+      provider = "consul"
+      port     = "CHANGE_ME_admin_port"
+
+      check {
+        name     = "healthz"
+        type     = "http"
+        # Public, unauthenticated and static: answers 200 without Keycloak.
+        # It proves the server is up, not that Keycloak/MinIO/Qdrant are
+        # reachable.
+        path     = "/signed-out"
+        port     = "CHANGE_ME_admin_port"
+        interval = "30s"
+        timeout  = "5s"
+      }
+    }
+  }
+}

@@ -7,11 +7,3 @@ export const ADMIN_HOME_PATH = '/admin/upload';
  * login again immediately.
  */
 export const ADMIN_SIGNED_OUT_PATH = '/signed-out';
-
-/**
- * Admin-owned routes that need neither a session nor the copied website's
- * locale routing.
- */
-export function isAdminPublicPath(pathname: string): boolean {
-  return pathname === '/' || pathname === ADMIN_SIGNED_OUT_PATH;
-}

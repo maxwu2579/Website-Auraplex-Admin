@@ -2,6 +2,8 @@
 
 ## Status
 
+> **Standalone Admin note.** This RFC was written when the feature lived inside the public website repository. The Admin application has since been split into this standalone repository: the public website routes, locale routing (`next-intl`), Sanity, the website catalogue and the website Nomad job are no longer part of it. Statements below about the public site describe the state at proposal time. The upload, storage, authentication and session contracts are unchanged. Products now come from `lib/admin/admin-products.ts`.
+
 Implemented on `codex/aura-int-001-admin-upload`; **pending real-environment validation** (see [Open Questions and Unverified Items](#open-questions-and-unverified-items)).
 
 - Owner: Max
@@ -91,7 +93,7 @@ The admin UI lives outside the locale-prefixed public site and does not render t
 
 ### Proxy exception for `/api/admin/uploads`
 
-`proxy.ts` composes `next-intl` routing for public routes with an authentication check for `/admin/:path*`, `/api/admin` and `/api/admin/*`, **except `/api/admin/uploads`**. Whenever Proxy runs, Next.js 16 tees the request body into an in-memory clone capped by `proxyClientMaxBodySize` (default 10 MiB) and truncates the Route Handler's copy at that cap; a local test reproduced this. Raising the cap would buffer whole uploads in memory, so the upload endpoint is excluded from the matcher instead. `/api/auth/*` is also excluded.
+`proxy.ts` applies an authentication check for `/admin/:path*`, `/api/admin` and `/api/admin/*`, **except `/api/admin/uploads`**. Whenever Proxy runs, Next.js 16 tees the request body into an in-memory clone capped by `proxyClientMaxBodySize` (default 10 MiB) and truncates the Route Handler's copy at that cap; a local test reproduced this. Raising the cap would buffer whole uploads in memory, so the upload endpoint is excluded from the matcher instead. `/api/auth/*` is also excluded.
 
 ### Route Handler security enforcement
 
@@ -162,7 +164,7 @@ The uploader chooses one of **five business lines**. Storage and search use one 
 | `software` | `software` | `auraplex_software` |
 | `consulting` | `consulting` | `auraplex_consulting` |
 
-`X-Product-ID` must be a real catalogue product ID belonging to the selected business line; the server resolves `product.slug` from the committed catalogue (`lib/admin/upload-products.ts`). Software and consulting have no catalogue products yet: the UI shows "no products configured yet" and the server rejects them with `INVALID_PRODUCT`. Placeholder IDs or slugs must not be added.
+`X-Product-ID` must be a real catalogue product ID belonging to the selected business line; the server resolves `product.slug` from the committed Admin product list (`lib/admin/admin-products.ts`). Software and consulting have no catalogue products yet: the UI shows "no products configured yet" and the server rejects them with `INVALID_PRODUCT`. Placeholder IDs or slugs must not be added.
 
 ### Object key
 
@@ -315,7 +317,7 @@ If Qdrant succeeds and MinIO fails, the response is `500 PARTIAL_DELETE` and the
 
 ## Infrastructure and Configuration
 
-The feature stays inside the existing `website` Nomad job; `deploy/website.nomad.hcl` documents the variables but does not guess production secret paths.
+The standalone Admin job's deployment identity (job, service, image, port, domain) is not decided yet; `deploy/admin.nomad.hcl.example` documents the variables with placeholders and does not guess production secret paths. It must not reuse the public website's job identity.
 
 Server-only runtime variables:
 

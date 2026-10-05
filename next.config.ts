@@ -1,26 +1,13 @@
 import type { NextConfig } from 'next';
-import createNextIntlPlugin from 'next-intl/plugin';
-
-const withNextIntl = createNextIntlPlugin('./lib/i18n.ts');
 
 const config: NextConfig = {
   reactStrictMode: true,
   // Emits .next/standalone with a self-contained server.js + a minimal
-  // node_modules subset, so the site runs as a plain Node container under
-  // Nomad instead of on Vercel's build output.
+  // node_modules subset, so the app runs as a plain Node container.
   output: 'standalone',
   // Next 16.2.7: cacheComponents promoted out of experimental.
   // https://nextjs.org/docs/app/api-reference/config/next-config-js/cacheComponents
   cacheComponents: true,
-  experimental: {
-    viewTransition: true,
-  },
-  images: {
-    formats: ['image/avif', 'image/webp'],
-    remotePatterns: [
-      { protocol: 'https', hostname: 'cdn.sanity.io' },
-    ],
-  },
   async headers() {
     return [
       {
@@ -31,12 +18,8 @@ const config: NextConfig = {
           { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
         ],
       },
-      {
-        source: '/fonts/(.*)',
-        headers: [{ key: 'Cache-Control', value: 'public, max-age=31536000, immutable' }],
-      },
     ];
   },
 };
 
-export default withNextIntl(config);
+export default config;

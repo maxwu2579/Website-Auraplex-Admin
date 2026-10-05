@@ -194,7 +194,7 @@ The uploader picks one of **five business lines** (`labelling`, `packaging`, `au
 - Object key: `{ingest_line}/{product.slug}/{sanitized_filename}` — exactly three segments, e.g. `machines/flexy-applicator/bottom-labelling-machine-brochure.pdf`. `product.slug` (not the numeric product ID) is the second segment.
 - Qdrant `payload.source_key`: `{bucket}/{key}`, e.g. `auraplex-raw-pdf/machines/flexy-applicator/bottom-labelling-machine-brochure.pdf`. One builder (`lib/admin/source-key.ts`) serves upload responses, status lookup and delete.
 - One resolver (`qdrantCollectionForSourceKey`) serves both status and delete. Unknown or legacy prefixes (for example keys written earlier under `labelling/...`) fail explicitly: there is no default collection and no scan of all collections. The status list reports such objects as **unsupported**, and delete rejects them with 400; clean up any pre-contract test objects manually.
-- Physical-machine products still validate a real catalogue `product_id`. Software and consulting have no catalogue products yet: the UI shows both lines as "no products configured yet" and the server rejects them with `INVALID_PRODUCT`. Add real products in `lib/admin/upload-products.ts` when they exist; never add placeholder IDs or slugs.
+- Physical-machine products still validate a real catalogue `product_id`. Software and consulting have no catalogue products yet: the UI shows both lines as "no products configured yet" and the server rejects them with `INVALID_PRODUCT`. Add real products in `lib/admin/admin-products.ts` when they exist; never add placeholder IDs or slugs.
 
 ## Upload streaming, sizes and limits
 
@@ -249,7 +249,7 @@ MinIO permissions (`docs/deployment/minio-admin-upload-policy.json`) include `s3
 
 ## Secret scanning
 
-`.github/workflows/secrets-scan.yml` runs gitleaks on pull requests, on pushes to `main`, `codex/**` and `docs/**`, and on manual dispatch. It downloads the gitleaks CLI v8.30.1, verifies its SHA-256, scans the full git history with `--redact`, and fails the job on any finding. It uses no repository secrets (the `gitleaks-action` wrapper was not used because it requires a license key on organization accounts). A local run of the same version on 2026-09-28 found no leaks in the branch history (141 commits) or in the uncommitted working tree.
+`.github/workflows/secrets-scan.yml` runs gitleaks on pull requests, on pushes to `admin-upload`, `main`, `codex/**` and `docs/**`, and on manual dispatch. It downloads the gitleaks CLI v8.30.1, verifies its SHA-256, scans the full git history with `--redact`, and fails the job on any finding. It uses no repository secrets (the `gitleaks-action` wrapper was not used because it requires a license key on organization accounts). A local run of the same version on 2026-09-28 found no leaks in the branch history (141 commits) or in the uncommitted working tree.
 
 ## Still requires real-environment validation
 

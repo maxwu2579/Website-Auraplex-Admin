@@ -1,8 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
 import test from 'node:test';
-import { pathToFileURL } from 'node:url';
 import { ADMIN_PRODUCTS } from '../lib/admin/admin-products';
 import { buildUploadObjectKey } from '../lib/admin/object-key';
 import { QDRANT_COLLECTIONS, qdrantCollectionForSourceKey } from '../lib/admin/server/qdrant';
@@ -158,27 +155,3 @@ test('software and consulting stay selectable business lines without fake produc
     }
   }
 });
-
-// Migration guard: while the public website catalogue is still in the repo,
-// prove the Admin dataset matches it field for field. Test-only dependency;
-// this test skips itself once a later phase deletes the catalogue.
-const CATALOGUE_PATH = path.join(process.cwd(), 'lib', 'catalog.ts');
-
-test(
-  'Admin dataset matches the legacy website catalogue',
-  { skip: existsSync(CATALOGUE_PATH) ? false : 'lib/catalog.ts has been removed' },
-  async () => {
-    const catalogue = (await import(pathToFileURL(CATALOGUE_PATH).href)) as {
-      MACHINES: { id: string; slug: string; name: string; category: string }[];
-    };
-    assert.deepEqual(
-      ADMIN_PRODUCTS.map(({ id, slug, name, businessLine }) => ({ id, slug, name, businessLine })),
-      catalogue.MACHINES.map(({ id, slug, name, category }) => ({
-        id,
-        slug,
-        name,
-        businessLine: category,
-      })),
-    );
-  },
-);

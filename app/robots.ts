@@ -1,10 +1,6 @@
 import type { MetadataRoute } from 'next';
-import { SITE } from '@/lib/seo';
 
+// The Admin application is not a public site: nothing is to be indexed.
 export default function robots(): MetadataRoute.Robots {
-  return {
-    rules: [{ userAgent: '*', allow: '/' }],
-    sitemap: `${SITE}/sitemap.xml`,
-    host: SITE,
-  };
+  return { rules: [{ userAgent: '*', disallow: '/' }] };
 }

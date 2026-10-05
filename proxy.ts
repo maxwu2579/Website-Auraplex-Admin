@@ -1,7 +1,4 @@
-import createMiddleware from 'next-intl/middleware';
 import { NextRequest, NextResponse } from 'next/server';
-import { routing } from './lib/navigation';
-import { isAdminPublicPath } from './lib/admin/admin-routes';
 import { canUpload, identityFromSession } from './lib/admin/server/authorization';
 import {
   PROXY_IDENTITY_HEADER,
@@ -11,10 +8,6 @@ import {
   sessionCookiesToCommit,
   type AdminSessionLoader,
 } from './lib/admin/server/session';
-
-// Locale routing serves only the copied public website pages. No Admin
-// route, and not the root entry, goes through it.
-const localeProxy = createMiddleware(routing);
 
 export function isProtectedAdminPath(pathname: string): boolean {
   return pathname === '/admin' || pathname.startsWith('/admin/') ||
@@ -69,10 +62,9 @@ function identityProviderUnavailable(pathname: string): NextResponse {
 export function createAdminProxy(loadSession: AdminSessionLoader = loadAdminSession) {
   return async function proxy(request: NextRequest) {
     const pathname = request.nextUrl.pathname;
-    // `/` and the signed-out page are Admin-owned and public: no locale
-    // redirect and no session.
-    if (isAdminPublicPath(pathname)) return NextResponse.next();
-    if (!isProtectedAdminPath(pathname)) return localeProxy(request);
+    // The matcher below only selects protected paths. Anything else (`/`,
+    // the signed-out page) is public and passes through untouched.
+    if (!isProtectedAdminPath(pathname)) return NextResponse.next();
 
     if (!process.env.AUTH_SECRET) {
       return new NextResponse('Authentication is not configured', { status: 503 });
@@ -106,10 +98,10 @@ export default createAdminProxy();
 export const PROXY_BYPASS_UPLOAD_PATH = '/api/admin/uploads';
 
 export const config = {
-  // Copied website pages (locale routing) plus explicit admin pages/APIs.
-  // Auth.js itself is excluded, and so is PROXY_BYPASS_UPLOAD_PATH (see above).
+  // Admin pages and APIs only. Auth.js (/api/auth/*), the public entry and
+  // signed-out pages are not matched, and neither is PROXY_BYPASS_UPLOAD_PATH
+  // (see above).
   matcher: [
-    '/((?!api|_next|_vercel|studio|admin|.*\\..*).*)',
     '/admin/:path*',
     '/api/admin',
     '/api/admin/((?!uploads$).*)',

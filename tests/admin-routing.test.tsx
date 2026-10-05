@@ -16,11 +16,7 @@ import RootPage from '../app/page';
 import SignedOutPage from '../app/signed-out/page';
 import { AdminDocument } from '../components/admin/admin-document';
 import { FileDropzone } from '../components/admin/upload-panel-parts';
-import {
-  ADMIN_HOME_PATH,
-  ADMIN_SIGNED_OUT_PATH,
-  isAdminPublicPath,
-} from '../lib/admin/admin-routes';
+import { ADMIN_HOME_PATH, ADMIN_SIGNED_OUT_PATH } from '../lib/admin/admin-routes';
 import { doubleSubmitCsrfValidator } from '../lib/admin/server/csrf';
 import { discoverKeycloakLogoutUrl } from '../lib/admin/server/keycloak-logout';
 import { InMemoryUploadRateLimiter } from '../lib/admin/server/rate-limit';
@@ -82,6 +78,7 @@ test('the root entry is Admin-owned and redirects to /admin/upload', () => {
 });
 
 test('the root entry does not go through locale routing or read a session', async () => {
+  assert.equal(proxyRuns('/'), false, 'Proxy is not selected for the root entry');
   const { load, calls } = recordingLoader();
   const response = await visit(createAdminProxy(load), '/');
   assert.equal(response.headers.get('x-middleware-next'), '1', 'passes straight to app/page.tsx');
@@ -92,21 +89,14 @@ test('the root entry does not go through locale routing or read a session', asyn
 
 test('the signed-out route is public and outside locale routing', async () => {
   assert.equal(ADMIN_SIGNED_OUT_PATH, '/signed-out');
-  assert.equal(isAdminPublicPath('/signed-out'), true);
-  assert.equal(isAdminPublicPath('/'), true);
   assert.equal(isProtectedAdminPath('/signed-out'), false);
+  assert.equal(proxyRuns('/signed-out'), false, 'Proxy is not selected for the signed-out page');
 
   const { load, calls } = recordingLoader();
   const response = await visit(createAdminProxy(load), '/signed-out');
   assert.equal(response.headers.get('x-middleware-next'), '1');
   assert.equal(response.headers.get('location'), null);
   assert.deepEqual(calls, [], 'no session is needed to see the signed-out page');
-});
-
-test('no protected Admin path is treated as public', () => {
-  for (const path of ['/admin', '/admin/upload', '/api/admin', '/api/admin/csrf', '/api/admin/uploads', '/signed-out/x', '/en']) {
-    assert.equal(isAdminPublicPath(path), false, path);
-  }
 });
 
 test('the signed-out page is minimal and offers a way back in', () => {
@@ -166,7 +156,6 @@ test('the upload API still bypasses Proxy; the other Admin paths still run it', 
   }
   assert.equal(proxyRuns('/api/auth/signin/keycloak'), false);
   assert.deepEqual(proxyConfig.matcher, [
-    '/((?!api|_next|_vercel|studio|admin|.*\\..*).*)',
     '/admin/:path*',
     '/api/admin',
     '/api/admin/((?!uploads$).*)',

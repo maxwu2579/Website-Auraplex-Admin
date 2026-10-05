@@ -9,8 +9,6 @@ const eslintConfig = defineConfig([
   ...nextTs,
   {
     rules: {
-      // Sanity payloads are unknown shapes until codegen is wired up.
-      '@typescript-eslint/no-explicit-any': 'off',
       // Modern JSX renders apostrophes/quotes correctly; the rule is noise.
       'react/no-unescaped-entities': 'off',
       // Allow unused imports prefixed with _ ; warn otherwise.
@@ -25,7 +23,6 @@ const eslintConfig = defineConfig([
     'out/**',
     'build/**',
     'node_modules/**',
-    'public/pagefind/**',
     'next-env.d.ts',
   ]),
 ]);
