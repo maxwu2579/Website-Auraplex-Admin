@@ -10,6 +10,8 @@ application. Three words are used with fixed meanings throughout:
 [Section D](#d-confirmed-deployment-values) lists every confirmed value and
 whether it is wired. What is still open is in [section E](#e-unresolved);
 none of it has been guessed. No secret value is stored in this repository.
+[Section G](#g-handoff-to-friendy) is the working list for taking the
+application to staging and production.
 
 Detailed runtime and security behaviour is in
 [AURA-INT-001-runtime.md](AURA-INT-001-runtime.md). The original design is in
@@ -66,7 +68,7 @@ Validated with automated tests and local builds only:
   as the `node` user) are required before deployment.
 - `deploy/admin.nomad.hcl`. Nomad was not available either, so the file has
   not been through `nomad job validate` or `nomad job plan`.
-- Everything in sections C to F.
+- Everything in sections C to G.
 
 ## C. Requires production configuration
 
@@ -435,3 +437,250 @@ None has been run.
 | 17 | Delete the upload as an admin | Qdrant points and the MinIO object are removed |
 | 18 | Read the application log | An audit line exists for each upload and delete |
 | 19 | Restart the container, then repeat checks 1, 3 and 10 | The same results. A user who was signed in either continues or is asked to sign in again; both are acceptable. An upload that was in progress during the restart fails and must be retried. See [Single instance and restarts](#single-instance-and-restarts) |
+
+## G. Handoff to Friendy
+
+This section is the working list for whoever takes the application to staging
+and production. It repeats nothing as settled that is still open: every open
+item points back to [section E](#e-unresolved).
+
+**State at handoff.** The application is feature-complete and its automated
+tests pass. It has not been deployed anywhere. The image has never been
+built, and `deploy/admin.nomad.hcl` is a draft that has never been validated
+and is **not safe to submit as it is**.
+
+### G1. Decisions needed first
+
+Nothing below can be finished without these. Each needs one explicit answer.
+
+| # | Decision | Why it blocks |
+| --- | --- | --- |
+| 1 | Keycloak callback and logout URIs: register the application's URIs, or change the application to the supplied ones | Sign-in fails at the callback if the registered URI differs. See [G5](#g5-keycloak-uris). |
+| 2 | How Nomad reads the Vault secret: KV engine version, whether `keycloak_client_secret` is a secret or a field, and the Vault role or policy for the job | The job has no secret injection. See [G4](#g4-environment-and-secrets). |
+| 3 | Values or sources for `AUTH_SECRET`, MinIO and Qdrant | Authentication, uploads and status do not work without them. |
+| 4 | Host port and network mode | The draft binds host port 3000 on `auraplex01`. See [G6](#g6-networking). |
+| 5 | Final upload size cap | Sets `ADMIN_UPLOAD_MAX_MB` and the ingress body limit. See [G7](#g7-upload-limits). |
+| 6 | Image tag strategy and how the image reaches `auraplex01` | Decides what CI publishes. See [G3](#g3-what-ci-must-build-and-publish). |
+| 7 | Staging identity: job, node, image | Only the staging hostname exists. See [G9](#g9-staging-checks). |
+
+### G2. Building the image
+
+From the repository root, with Docker available:
+
+```bash
+docker build -t auraplex.local/admin-upload:v1 .
+```
+
+- The build needs no secrets and no build arguments. Do not pass any secret
+  as a build argument; every secret is read at runtime.
+- The one optional build argument is `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB`, a
+  UI-only ceiling. Leave it out so the UI follows the server's runtime cap.
+- `.dockerignore` keeps local `.env` files out of the build context.
+- The image runs as the unprivileged `node` user and listens on port 3000.
+
+This build has **never been run**: Docker was not available where the
+repository was prepared. Before the image is used, smoke-test the container:
+
+```bash
+docker run --rm -d --name admin-upload-smoke -p 3000:3000 auraplex.local/admin-upload:v1
+curl -i http://localhost:3000/api/health     # 200 {"status":"ok","service":"auraplex-admin"}
+docker exec admin-upload-smoke id -un         # node
+docker rm -f admin-upload-smoke
+```
+
+The container starts and answers the health check with no environment
+variables set. That confirms the image only; it says nothing about sign-in
+or uploads.
+
+### G3. What CI must build and publish
+
+The repository has one workflow today, `.github/workflows/secrets-scan.yml`
+(gitleaks). There is no workflow that tests or builds. CI needs to:
+
+1. Use Node.js 22 and run `npm ci`.
+2. Run `npm run typecheck`, `npm run lint` and `npm test`. `npm test` must
+   end with no failed and no cancelled tests. The tests need no internet
+   access, no production services and no real secrets. Some of them start
+   local HTTP servers, so the runner must allow loopback (`localhost`)
+   connections.
+3. Run `npm run build`.
+4. Build the image as in [G2](#g2-building-the-image) and run the container
+   smoke test.
+5. Publish the image under the name the job uses,
+   `auraplex.local/admin-upload`, somewhere Docker on `auraplex01` can pull
+   it from.
+
+Open points for CI:
+
+- **Where the image is published.** The job names `auraplex.local/admin-upload:v1`.
+  Whether `auraplex.local` is a registry that CI can push to, or the image is
+  built or loaded on the node, is not recorded in this repository.
+- **Tag strategy.** Only `v1` has been confirmed. If a later build reuses the
+  tag `v1`, Nomad's Docker driver does not pull it again by default, so the
+  node can keep running the old image. Either publish a new tag per build and
+  update the job, or decide how a reused tag is refreshed.
+- CI must not run `nomad job run` against this draft.
+
+### G4. Environment and secrets
+
+Every variable the application reads. "Friendy" says whether a value must be
+provided or configured for a deployment. No variable is checked at startup;
+a missing one shows up when the feature that needs it is used.
+
+| Variable | Purpose | Required | Default | Secret | Expected source | Friendy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `AUTH_SECRET` | Encrypts the session cookie and the Proxy identity handoff | yes, for authentication | none | **yes** | runtime secret injection; store not specified | provide: a long random value, kept the same across restarts |
+| `AUTH_URL` | Public origin of the application; used for the Keycloak logout redirect | yes, in any deployed environment | none | no | job `env` (production value is in the draft) | set the staging value in the staging job |
+| `KEYCLOAK_ISSUER` | Keycloak realm issuer URL | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
+| `KEYCLOAK_CLIENT_ID` | Keycloak client ID | yes, for authentication | none | no | job `env` (in the draft) | nothing, unless staging differs |
+| `KEYCLOAK_CLIENT_SECRET` | Secret of the confidential Keycloak client | yes, for authentication | none | **yes** | Vault: `kv/auraplex/admin-upload/keycloak_client_secret` | wire the injection; see below |
+| `KEYCLOAK_UPLOADER_ROLE` | Keycloak group allowed to upload | no | `auraplex-uploader` | no | job `env`, only to override | confirm the group exists, or set another name |
+| `KEYCLOAK_ADMIN_ROLE` | Keycloak group allowed to administer and delete | no | `auraplex-admin` | no | job `env`, only to override | confirm the group exists, or set another name |
+| `MINIO_ENDPOINT` | MinIO S3 endpoint URL | yes, for upload and storage | none | no | job `env`; value not supplied | provide |
+| `MINIO_ACCESS_KEY` | MinIO access key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |
+| `MINIO_SECRET_KEY` | MinIO secret key | yes, for upload and storage | none | **yes** | runtime secret injection; store not specified | provide |
+| `MINIO_REGION` | S3 region name sent to MinIO | no | `us-east-1` | no | job `env`, only to override | nothing, unless MinIO uses another region |
+| `QDRANT_URL` | Qdrant endpoint, for processing status and delete | yes, for status and delete | none | no | job `env`; value not supplied | provide |
+| `QDRANT_API_KEY` | Qdrant API key | only if Qdrant requires a key | none | **yes** | runtime secret injection; store not specified | provide if Qdrant requires one |
+| `ADMIN_UPLOAD_MAX_MB` | Server-enforced per-file size cap | no | `100` (range 1–500) | no | job `env` | set once the cap is decided |
+| `ADMIN_UPLOAD_MAX_CONCURRENT` | Concurrent uploads per process | no | `4` (range 1–16) | no | job `env`, only to override | decide whether 4 fits in 512 MB |
+| `ADMIN_TRUSTED_PROXY_SECRET` | Lets audit logging trust `cf-connecting-ip` | no; only with matching APISIX configuration | unset | **yes** | runtime secret injection, only if used | leave unset unless APISIX strips and injects the header |
+| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | UI-only upload ceiling, fixed when the image is built | no | unset | no | Docker build argument | leave unset |
+| `NODE_ENV` | Must be `production`: enables HTTPS-only cookies and logout | yes | `production` in the image | no | image and job `env` | nothing |
+| `PORT` | Port the server listens on | yes | `3000` in the image | no | image and job `env` | nothing; see [G6](#g6-networking) |
+| `HOSTNAME` | Address the server binds to | yes | `0.0.0.0` in the image | no | image and job `env` | nothing |
+
+Secrets needing runtime injection: `AUTH_SECRET`, `KEYCLOAK_CLIENT_SECRET`,
+`MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `QDRANT_API_KEY` and
+`ADMIN_TRUSTED_PROXY_SECRET` where they are used.
+
+- Only one Vault location has been supplied:
+  `kv/auraplex/admin-upload/keycloak_client_secret`. It is a path. No secret
+  value has been read, and none is in this repository.
+- The job contains no Vault or template stanza. Nothing here states the KV
+  engine version, whether `keycloak_client_secret` is the secret or a field
+  inside `kv/auraplex/admin-upload`, or which Vault role the job uses. The
+  injection has to be written from the pattern that already works for other
+  Auraplex jobs.
+- Where the other secrets live has not been specified.
+- `AUTH_SECRET` must not change between restarts or redeployments unless the
+  intention is to sign everyone out: existing session cookies cannot be read
+  with a different value.
+
+### G5. Keycloak URIs
+
+**BLOCKED / awaiting Friendy confirmation.** The application is unchanged
+and uses:
+
+| Environment | Redirect URI (callback) | Post-logout redirect URI |
+| --- | --- | --- |
+| Production | `https://admin-auraplex.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex.auraplex.info/signed-out` |
+| Staging | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex-staging.auraplex.info/signed-out` |
+
+The URIs supplied for the client were `/api/auth/callback` and
+`/api/auth/logout` on the same hosts. The application has neither route. If
+the application stays as it is, the four URIs in the table are the ones that
+must be registered on client `auraplex-admin-upload`. If the supplied URIs
+are to be used instead, the application has to change first, and that has not
+been done. The comparison is in
+[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris--blocked).
+
+The client must also issue refresh tokens, rotate them on every use, and put
+`groups` in the ID token; see [Keycloak client](#keycloak-client).
+
+### G6. Networking
+
+Confirmed: the application listens on internal port 3000, and traffic arrives
+through APISIX and the Cloudflare Tunnel. Everything else is open.
+
+The draft uses host networking with a static port, so it binds **host port
+3000 on `auraplex01`**. That is carried over from the reviewed template, not
+confirmed. The public website has been documented as listening on host port
+3000 with host networking. If it runs on `auraplex01`, the two jobs cannot
+both hold the port.
+
+The choices, none of which has been made:
+
+- **Keep the draft**, after confirming that nothing else on `auraplex01` uses
+  host port 3000.
+- **Map a host port to internal port 3000**, with the host port static or
+  dynamic. The application keeps listening on 3000. This is a change of
+  network mode in the job, and APISIX then has to reach the mapped port, for
+  example through the Consul service.
+
+Whichever is chosen, the pieces have to agree:
+
+- The Node.js server listens on the port given by `PORT`, which is `3000`.
+- Changing only Nomad's static host port does not change the port the
+  application listens on.
+- A port reservation or mapping that does not lead to the port the
+  application listens on can break service discovery, routing or the health
+  check, even though the process itself is running.
+- The network mode, the port block, `PORT`, and the service and check ports
+  must therefore be changed together and kept consistent.
+
+Also needed, and not in this repository: the APISIX route for each hostname
+to the Admin service, and the Cloudflare Tunnel configuration. APISIX and
+Cloudflare must pass request bodies up to the upload cap without buffering,
+and must leave `/api/health` and `/signed-out` reachable without
+authentication.
+
+### G7. Upload limits
+
+The final cap is not decided. Until it is, the server default of 100 MB
+applies and the job sets nothing.
+
+Once a value is chosen:
+
+1. Set `ADMIN_UPLOAD_MAX_MB` in the job to that value (1–500). The UI follows
+   it without a rebuild.
+2. Make APISIX, Cloudflare and anything else in the path allow request bodies
+   of at least that size.
+3. Leave `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` unset.
+4. Decide `ADMIN_UPLOAD_MAX_CONCURRENT`. The default of 4 was measured
+   against a 1024 MB task; the job has 512 MB, and that combination has not
+   been measured.
+
+### G8. The Nomad job
+
+The file to use is `deploy/admin.nomad.hcl`, **after** the items below are
+done. It must not be submitted before then; see
+[The Nomad job draft](#the-nomad-job-draft).
+
+1. Add the runtime secret injection ([G4](#g4-environment-and-secrets)).
+2. Add `MINIO_ENDPOINT` and `QDRANT_URL`, and the upload settings from
+   [G7](#g7-upload-limits).
+3. Settle the network block ([G6](#g6-networking)).
+4. Decide whether an update policy is needed so that an old and a new
+   allocation cannot overlap. `count = 1` must stay; canary and scaling
+   settings must not be added.
+5. Run `nomad job validate` and `nomad job plan`. Neither has ever been run
+   on this file.
+
+Already in the file and confirmed: job `admin-upload`, group `web`, service
+`admin-upload`, datacenter `acumen-local`, node `auraplex01`, image
+`auraplex.local/admin-upload:v1`, CPU 500, memory 512 MB, one instance, and
+the `GET /api/health` check.
+
+The health check is liveness only. It passes with no secrets and with
+Keycloak, MinIO and Qdrant unreachable, so a healthy allocation is not proof
+of a working deployment.
+
+### G9. Staging checks
+
+No staging environment is defined: there is no staging job, node or image,
+only the hostname `admin-auraplex-staging.auraplex.info`. Staging needs its
+own job with `AUTH_URL` set to `https://admin-auraplex-staging.auraplex.info`
+and the staging URIs registered in Keycloak.
+
+Before production, on staging:
+
+1. Run every check in [section F](#f-production-smoke-tests). They are
+   written for the first deployment and apply to staging unchanged.
+2. Pay particular attention to the checks that have only ever run against
+   local fakes: sign-in and group checks against the real realm (4 to 7),
+   logout through Keycloak (8), an upload at the size cap through APISIX and
+   Cloudflare (11), and the stored object and Qdrant status (14, 15).
+3. Restart the allocation and repeat checks 1, 3 and 10 (check 19).
+4. Update the job once and confirm that only one allocation serves traffic
+   during the update.

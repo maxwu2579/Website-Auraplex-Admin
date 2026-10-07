@@ -297,6 +297,50 @@ test('the final upload cap is left open and not set by the job', () => {
   assert.match(deploymentDoc, /\| 1 \| Final production upload cap \| Not decided\./);
 });
 
+test('the handoff section lists every environment variable and marks the secrets', () => {
+  const start = deploymentDoc.indexOf('### G4. Environment and secrets');
+  assert.notEqual(start, -1);
+  const section = deploymentDoc.slice(start, deploymentDoc.indexOf('\n### ', start + 1));
+  const rows = new Map(
+    section.split('\n')
+      .map((line) => /^\| `([A-Z][A-Z0-9_]*)` \|/.exec(line) ? line.split('|').map((cell) => cell.trim()) : null)
+      .filter((cells): cells is string[] => cells !== null)
+      .map((cells): [string, string[]] => [cells[1].replaceAll('`', ''), cells]),
+  );
+
+  // Everything in the environment template, plus what the image sets.
+  const templated = envExample.split('\n')
+    .map((line) => /^([A-Z][A-Z0-9_]*)=/.exec(line)?.[1])
+    .filter((name): name is string => name !== undefined);
+  assert.ok(templated.length > 0);
+  for (const name of [...templated, 'NODE_ENV', 'PORT', 'HOSTNAME']) assert.ok(rows.has(name), name);
+
+  // Column 5 is "Secret". Exactly these hold credentials.
+  const secrets = [...rows].filter(([, cells]) => cells[5] === '**yes**').map(([name]) => name).sort();
+  assert.deepEqual(secrets, [
+    'ADMIN_TRUSTED_PROXY_SECRET', 'AUTH_SECRET', 'KEYCLOAK_CLIENT_SECRET',
+    'MINIO_ACCESS_KEY', 'MINIO_SECRET_KEY', 'QDRANT_API_KEY',
+  ]);
+  for (const [name, cells] of rows) {
+    if (cells[5] !== '**yes**') assert.equal(cells[5], 'no', name);
+  }
+  // The only Vault location named is the confirmed one, or its parent path.
+  const vaultPaths: string[] = section.match(/kv\/[\w\/-]+/g) ?? [];
+  assert.ok(vaultPaths.includes(VAULT_PATH));
+  for (const path of vaultPaths) assert.ok(VAULT_PATH.startsWith(path), path);
+});
+
+test('the handoff section does not present the job or the image as ready', () => {
+  const start = deploymentDoc.indexOf('## G. Handoff to Friendy');
+  assert.notEqual(start, -1);
+  const handoff = deploymentDoc.slice(start);
+  assert.match(handoff, /\*\*not safe to submit as it is\*\*/);
+  assert.match(handoff, /It has not been deployed anywhere/);
+  assert.match(handoff, /This build has \*\*never been run\*\*/);
+  assert.match(handoff, /\*\*BLOCKED \/ awaiting Friendy confirmation\.\*\*/);
+  assert.match(handoff, /docker build -t auraplex\.local\/admin-upload:v1 \./);
+});
+
 test('.dockerignore keeps local environment files out of the build context', () => {
   const lines = read('.dockerignore').split('\n').map((line) => line.trim());
   for (const pattern of ['.env', '.env.*', '!.env.example', 'node_modules', '.next', '.git']) {

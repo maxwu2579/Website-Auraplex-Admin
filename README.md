@@ -193,7 +193,9 @@ development use `npm run dev` instead.
 
 Nothing is deployed: there has been no production deployment and no staging
 deployment. The confirmed values, the open items and the production smoke
-tests are in `docs/deployment/AURAPLEX-ADMIN-deployment.md`.
+tests are in `docs/deployment/AURAPLEX-ADMIN-deployment.md`. Section G of
+that document is the handoff list: building the image, what CI must do, the
+environment and secrets, and the decisions still needed.
 
 - **Confirmed by Friendy and wired** into `deploy/admin.nomad.hcl`, a draft
   of the production job: the production hostname
