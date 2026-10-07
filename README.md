@@ -72,7 +72,7 @@ lib/admin/server/     Session, Keycloak, storage, Qdrant, limits, audit
 styles/admin.css      The only stylesheet
 tests/                Automated tests
 docs/                 User guide, runtime/deployment notes, RFC, MinIO policy
-deploy/               Example (non-production) Nomad job
+deploy/               Production Nomad job draft (must not be submitted)
 ```
 
 ## Products and storage contract
@@ -101,8 +101,10 @@ can be uploaded to them; add real records only, never placeholders.
   token**. Access is granted by group membership only: the uploader and admin
   groups default to `auraplex-uploader` and `auraplex-admin`
   (`KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`).
-- Valid redirect URI: `<AUTH_URL>/api/auth/callback/keycloak`.
-- Valid post-logout redirect URI: `<AUTH_URL>/signed-out`.
+- The application sends the redirect URI
+  `<AUTH_URL>/api/auth/callback/keycloak` and the post-logout redirect URI
+  `<AUTH_URL>/signed-out`. Their registration on the Keycloak client is
+  **blocked** pending a decision; see the deployment document.
 
 Sessions end after 30 minutes without activity and 12 hours after sign-in.
 Every session is re-verified with Keycloak once its last verification is 60
@@ -124,15 +126,20 @@ All variables are listed with comments in `.env.example`. Every one is
 server-only and read at runtime, except the optional
 `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB`, a build-time UI-only ceiling.
 
-| Variable | Notes |
+| Variable | Needed for |
 | --- | --- |
-| `AUTH_SECRET` | Required. Encrypts the session cookie. |
-| `AUTH_URL` | Required. Public origin of this application. |
-| `KEYCLOAK_*` | See Keycloak requirements. |
-| `MINIO_*`, `QDRANT_*` | See MinIO and Qdrant requirements. |
-| `ADMIN_UPLOAD_MAX_MB` | Server-enforced per-file cap, 1–500, default 100. |
-| `ADMIN_UPLOAD_MAX_CONCURRENT` | Concurrent uploads per process, 1–16, default 4. |
-| `ADMIN_TRUSTED_PROXY_SECRET` | Optional; see the runtime notes before setting. |
+| `AUTH_SECRET`, `KEYCLOAK_ISSUER`, `KEYCLOAK_CLIENT_ID`, `KEYCLOAK_CLIENT_SECRET` | Required for authentication. |
+| `AUTH_URL` | Public origin of this application. Needed for Keycloak logout; set it in every environment behind an ingress. |
+| `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY` | Required for upload and storage. |
+| `QDRANT_URL` | Required for processing status and delete; uploads work without it. |
+| `QDRANT_API_KEY` | Conditional: only if Qdrant requires a key. |
+| `KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`, `MINIO_REGION` | Optional; defaulted. |
+| `ADMIN_UPLOAD_MAX_MB` | Optional. Server-enforced per-file cap, 1–500, default 100. |
+| `ADMIN_UPLOAD_MAX_CONCURRENT` | Optional. Concurrent uploads per process, 1–16, default 4. |
+| `ADMIN_TRUSTED_PROXY_SECRET` | Conditional; see the runtime notes before setting. |
+
+No variable is validated at startup: the server starts, and `/api/health`
+answers, even with none of them set.
 
 ## Testing
 
@@ -184,32 +191,45 @@ development use `npm run dev` instead.
 
 ## Deployment prerequisites
 
-Deployment is not configured yet. The full checklist, including the values
-still to be confirmed and the production smoke tests, is in
-`docs/deployment/AURAPLEX-ADMIN-deployment.md`. In short, before a first
-production deployment:
+Nothing is deployed: there has been no production deployment and no staging
+deployment. The confirmed values, the open items and the production smoke
+tests are in `docs/deployment/AURAPLEX-ADMIN-deployment.md`.
 
-- Decide the Admin deployment identity: domain, ingress route, job and
-  service names, image name and port. `deploy/admin.nomad.hcl.example` is a
-  placeholder template and must not be run as it is. It must not reuse the
-  public website's job, service or image names.
-- Create or configure the Keycloak client, including the redirect and
-  post-logout URIs above.
-- Provide the secrets and service addresses through the deployment secret
-  store.
-- Confirm that the ingress allows request bodies up to the configured upload
-  size and does not buffer them.
-- Run the end-to-end checks listed as unverified in
+- **Confirmed by Friendy and wired** into `deploy/admin.nomad.hcl`, a draft
+  of the production job: the production hostname
+  `admin-auraplex.auraplex.info` (as `AUTH_URL`), the Keycloak issuer and
+  client ID, and the Nomad job, service, internal port, datacenter, node,
+  image and resources, as a single instance.
+- **Confirmed but only documented:** the staging hostname
+  `admin-auraplex-staging.auraplex.info`. No staging job exists.
+
+The draft is not production-ready and must not be submitted to Nomad. Nothing
+in the file prevents Nomad from accepting it, and the health check would pass
+even without the secrets.
+
+Still open before a first deployment:
+
+- **Blocked:** which callback and logout URIs are registered on the Keycloak
+  client. The supplied URIs differ from the ones the application uses.
+- Runtime secret injection. The Keycloak client secret comes from Vault
+  (`kv/auraplex/admin-upload/keycloak_client_secret`); the Nomad wiring and
+  the other secrets and service addresses are not in place.
+- The host port and network mapping. Only the internal port, 3000, is
+  confirmed.
+- The final upload size cap, and confirmation that the ingress allows request
+  bodies of that size without buffering them.
+- A real Docker build and container smoke test; none has been run.
+- The end-to-end checks listed as unverified in
   `docs/deployment/AURA-INT-001-runtime.md`: real Keycloak, MinIO, Qdrant and
   ingress behaviour have only been tested against local fakes.
-- Triage the open `npm audit` findings
+- Triage of the open `npm audit` findings
   (`docs/deployment/AURA-INT-001-dependency-review.md`).
 
 ## Documentation
 
 - `docs/admin-upload-guide.md` — user guide
 - `docs/deployment/AURAPLEX-ADMIN-deployment.md` — deployment readiness,
-  open confirmations and smoke tests
+  confirmed values, open items and smoke tests
 - `docs/deployment/AURA-INT-001-runtime.md` — runtime and security behaviour
 - `docs/deployment/AURA-INT-001-dependency-review.md` — dependency audit
 - `docs/deployment/minio-admin-upload-policy.json` — MinIO access policy

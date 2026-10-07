@@ -317,7 +317,7 @@ If Qdrant succeeds and MinIO fails, the response is `500 PARTIAL_DELETE` and the
 
 ## Infrastructure and Configuration
 
-The standalone Admin job's deployment identity (job, service, image, port, domain) is not decided yet; `deploy/admin.nomad.hcl.example` documents the variables with placeholders and does not guess production secret paths. It must not reuse the public website's job identity.
+The standalone Admin job's deployment identity (job, service, image, port, domain) is set in `deploy/admin.nomad.hcl`; runtime secret injection is not wired there and is not guessed. See `docs/deployment/AURAPLEX-ADMIN-deployment.md`. The job must not reuse the public website's job identity.
 
 Server-only runtime variables:
 

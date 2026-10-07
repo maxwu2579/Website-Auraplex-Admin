@@ -188,18 +188,9 @@ test('secret scanning runs on pushes to the default branch with the pinned gitle
   assert.match(workflow, /gitleaks git --redact --verbose --exit-code 1 \./);
 });
 
-test('the deployment example cannot be mistaken for, or overwrite, the public website job', () => {
+test('the deployment job cannot be mistaken for, or overwrite, the public website job', () => {
   assert.equal(exists('deploy', 'website.nomad.hcl'), false);
-  const example = read('deploy', 'admin.nomad.hcl.example');
-  assert.doesNotMatch(example, /job\s+"website"|auraplex-website|auraplex\.local\/website|path\s*=\s*"\/en"/);
-  assert.match(example, /NOT PRODUCTION-READY/);
-  assert.match(example, /path\s*=\s*"\/api\/health"/);
-  // Every deployment identity is still an obvious placeholder.
-  assert.match(example, /job "CHANGE_ME_AURAPLEX_ADMIN_JOB"/);
-  assert.match(example, /name\s*=\s*"CHANGE_ME_AURAPLEX_ADMIN_SERVICE"/);
-  assert.match(example, /image\s*=\s*"CHANGE_ME_AURAPLEX_ADMIN_IMAGE"/);
-  assert.match(example, /datacenters = \["CHANGE_ME_AURAPLEX_ADMIN_DATACENTER"\]/);
-  for (const port of example.matchAll(/\b(?:PORT|port)\s*=\s*"([^"]*)"/g)) {
-    assert.equal(port[1], 'CHANGE_ME_AURAPLEX_ADMIN_PORT');
-  }
+  const job = read('deploy', 'admin.nomad.hcl');
+  assert.doesNotMatch(job, /job\s+"website"|auraplex-website|auraplex\.local\/website|path\s*=\s*"\/en"/);
+  assert.match(job, /path\s*=\s*"\/api\/health"/);
 });

@@ -1,6 +1,12 @@
 node_modules
 .next
 .git
+# Local environment files and secrets never enter the build context. The image
+# needs none of them: every secret is read at runtime. Only the empty template
+# is allowed through.
+.env
+.env.*
+!.env.example
 .env.local
 .env*.local
 .vercel
