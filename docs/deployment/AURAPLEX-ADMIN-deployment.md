@@ -13,6 +13,11 @@ none of it has been guessed. No secret value is stored in this repository.
 [Section G](#g-handoff-to-friendy) is the working list for taking the
 application to staging and production.
 
+Friendy has confirmed that he handles the remaining infrastructure and
+deployment work: Vault, the MinIO and Qdrant runtime configuration, Nomad
+networking, Docker image publishing, APISIX and Cloudflare, and the staging
+and production deployments. No application-side decision is outstanding.
+
 Detailed runtime and security behaviour is in
 [AURA-INT-001-runtime.md](AURA-INT-001-runtime.md). The original design is in
 [the RFC](../rfc/AURA-INT-001-admin-upload.md).
@@ -106,7 +111,7 @@ feature that needs it is used.
 | --- | --- |
 | `KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE` | `auraplex-uploader`, `auraplex-admin` |
 | `MINIO_REGION` | `us-east-1` |
-| `ADMIN_UPLOAD_MAX_MB` | 100; range 1–500 |
+| `ADMIN_UPLOAD_MAX_MB` | 100 (the application fallback, used in development and testing); range 1–500. Production is confirmed as 300 and set in the job. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | 4 per process; range 1–16 |
 | `PORT`, `HOSTNAME` | `3000` and `0.0.0.0`, set by the image |
 
@@ -116,7 +121,7 @@ feature that needs it is used.
 | --- | --- |
 | `QDRANT_API_KEY` | the Qdrant deployment requires a key. |
 | `ADMIN_TRUSTED_PROXY_SECRET` | the ingress strips any client-supplied `x-auraplex-proxy-secret` header and injects its own. See the runtime notes first. |
-| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | the UI must show a lower ceiling than the server cap. Build-time and UI-only; normally unset. |
+| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | the UI must show a lower ceiling than the server cap. Build-time and UI-only; normally unset. For the production build it must be unset or `300`; see [G7](#g7-upload-limits). |
 
 `AUTH_URL` must be the exact public origin users reach, with no trailing
 slash. In production it must be HTTPS: the logout redirect is refused
@@ -131,6 +136,7 @@ Confirmed values, and where each one is wired:
 | `KEYCLOAK_ISSUER` | `https://keycloak.auraplex.info/realms/auraplex` | yes, in `deploy/admin.nomad.hcl` |
 | `KEYCLOAK_CLIENT_ID` | `auraplex-admin-upload` | yes, in `deploy/admin.nomad.hcl` |
 | `KEYCLOAK_CLIENT_SECRET` | source only: Vault path below | no; injection not wired |
+| `ADMIN_UPLOAD_MAX_MB` (production) | `300` | yes, in `deploy/admin.nomad.hcl` |
 
 One issuer and one client ID were supplied, with no separate staging client.
 No value or source has been supplied for `AUTH_SECRET`, the MinIO variables
@@ -175,14 +181,15 @@ production-ready and must not be submitted to Nomad.**
 Realm `auraplex`, client `auraplex-admin-upload`, access type confidential.
 `<AUTH_URL>` stands for the public origin of the environment.
 
-The two URIs below are what the application uses today. They do **not** match
-the URIs Friendy supplied, and this is not settled: see
-[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris--blocked).
+The two URIs below are what the application sends. They differ from the
+callback and logout URLs Friendy supplied; he has confirmed that those are
+handled by the local server, so the application is unchanged. See
+[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris).
 
-| Setting | Required value |
+| Setting | Value |
 | --- | --- |
-| Valid redirect URI (callback) | `<AUTH_URL>/api/auth/callback/keycloak` (what the application sends; registration **blocked**) |
-| Valid post-logout redirect URI | `<AUTH_URL>/signed-out` (what the application sends; registration **blocked**) |
+| Redirect URI (callback) | `<AUTH_URL>/api/auth/callback/keycloak` is what the application sends. Client registration and the handling of the supplied URLs are Friendy's. |
+| Post-logout redirect URI | `<AUTH_URL>/signed-out` is what the application sends. Client registration and the handling of the supplied URLs are Friendy's. |
 | Root URL / web origin | `<AUTH_URL>`. Sign-in and logout are full-page redirects and token calls are made server-side, so no browser cross-origin access to Keycloak is needed. |
 | Client authentication | Confidential client with a secret; the token endpoint is called with Basic client authentication. |
 | Refresh tokens | Must be issued at sign-in and **rotated on every use**. A refresh that returns no new token is treated as a failure. |
@@ -357,43 +364,58 @@ of it is deployed.
 | Container image | `auraplex.local/admin-upload:v1` | yes; the image itself has not been built |
 | Resources | CPU `500`, memory `512` MB | yes |
 | Deployment model | single instance | yes, `count = 1` |
+| Production upload cap | 300 MB | yes, `ADMIN_UPLOAD_MAX_MB = "300"` in the job draft |
+| Keycloak callback and logout URLs | the supplied URLs are handled by the local server; the Auth.js routes stay as they are | n/a; no application change |
+| Remaining infrastructure and deployment work | handled by Friendy | n/a |
 
 "Wired" means present in `deploy/admin.nomad.hcl`, which is a draft of the
 production job. There is no staging job.
 
-## E. Unresolved
+### Keycloak callback and logout URIs
 
-Nothing below has been guessed or changed in code. Each item needs one
-explicit answer before the first deployment.
+**Settled; no application change.** Friendy confirmed that the callback and
+logout URLs he supplied are handled by the local server. The current Auth.js
+routes therefore remain unchanged, and no further application decision is
+required.
 
-### Keycloak callback and logout URIs — BLOCKED
-
-**BLOCKED / awaiting Friendy confirmation.** The URIs supplied for the
-Keycloak client differ from the ones the application uses.
-
-| | Supplied by Friendy | Used by the application today |
+| | Supplied by Friendy | Sent by the application |
 | --- | --- | --- |
 | Production callback | `https://admin-auraplex.auraplex.info/api/auth/callback` | `https://admin-auraplex.auraplex.info/api/auth/callback/keycloak` |
 | Production logout | `https://admin-auraplex.auraplex.info/api/auth/logout` | post-logout redirect to `https://admin-auraplex.auraplex.info/signed-out` |
 | Staging callback | `https://admin-auraplex-staging.auraplex.info/api/auth/callback` | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/keycloak` |
 | Staging logout | `https://admin-auraplex-staging.auraplex.info/api/auth/logout` | post-logout redirect to `https://admin-auraplex-staging.auraplex.info/signed-out` |
 
-- The application has no `/api/auth/callback` route without the provider
-  segment and no `/api/auth/logout` route. Auth.js completes sign-in on
-  `/api/auth/callback/keycloak`, and logout returns to `/signed-out`.
-- Keycloak compares redirect URIs exactly unless a wildcard is registered. If
-  only the supplied URIs are registered, sign-in fails at the callback and
-  Keycloak refuses the post-logout redirect.
 - Application routes, the Auth.js configuration, the logout implementation and
-  `post_logout_redirect_uri` are deliberately unchanged. The decision is one
-  of: register the application's URIs on the client, or change the
-  application to the supplied URIs.
+  `post_logout_redirect_uri` are unchanged and stay that way. The application
+  itself still has no `/api/auth/callback` route without the provider segment
+  and no `/api/auth/logout` route: Auth.js completes sign-in on
+  `/api/auth/callback/keycloak`, and logout returns to `/signed-out`.
+- How the local server handles the supplied URLs is not part of this
+  repository and is not described here. That handling, and the registration
+  on client `auraplex-admin-upload`, are Friendy's.
+- For reference when it is set up: the right-hand column is what the
+  application puts in `redirect_uri` and `post_logout_redirect_uri`, and
+  Keycloak compares those exactly unless a wildcard is registered. Sign-in
+  and logout against the real realm are checks 4 and 8 in
+  [section F](#f-production-smoke-tests).
 
-### Other open items
+## E. Unresolved
+
+Nothing below has been guessed or changed in code. Friendy has confirmed that
+he handles the remaining infrastructure and deployment work, which covers
+every item here: Vault, the MinIO and Qdrant runtime configuration, Nomad
+networking, Docker image publishing, APISIX and Cloudflare, and the staging
+and production deployments. None of them needs an application-side decision.
+
+The two questions that were open on the application side are settled and are
+recorded in [section D](#d-confirmed-deployment-values): the Keycloak
+callback and logout URLs, and the production upload cap of 300 MB.
+
+### Open items
 
 | # | Item | State |
 | --- | --- | --- |
-| 1 | Final production upload cap | Not decided. 100 MB, 300 MB and 500 MB have all been mentioned. The code is unchanged: the server default is 100 MB, the supported range is 1–500, and `ADMIN_UPLOAD_MAX_MB` is not set in the job. One explicit value is needed, and APISIX and Cloudflare must allow at least that size. |
+| 1 | Ingress limits for the 300 MB upload cap | The cap itself is decided: 300 MB, set as `ADMIN_UPLOAD_MAX_MB` in the job. Not verified: that APISIX and Cloudflare pass request bodies of at least that size. Cloudflare's request-body limit depends on the plan; see the [runtime notes](AURA-INT-001-runtime.md). |
 | 2 | Vault/Nomad injection of `KEYCLOAK_CLIENT_SECRET` | Path confirmed; mechanism not wired. Needed: the KV engine version, whether `keycloak_client_secret` is a secret or a field inside `kv/auraplex/admin-upload`, and the Vault role or policy for the job. |
 | 3 | `AUTH_SECRET` | Value and source not supplied. |
 | 4 | MinIO endpoint, access key and secret key | Not supplied. The three buckets must exist and the key needs the documented policy. |
@@ -428,7 +450,7 @@ None has been run.
 | 8 | Sign out (normal path) | The browser passes through Keycloak's logout endpoint and lands on `/signed-out`; the local session is cleared. Then confirm in Keycloak that the SSO session has ended: the application does not verify this itself |
 | 9 | Sign out while Keycloak discovery is unreachable from the application (fallback path), if this can be arranged safely | The browser still lands on `/signed-out` and the local session is cleared. The Keycloak SSO session is **not** expected to have ended; do not record it as ended |
 | 10 | Upload a small PDF | Succeeds |
-| 11 | Upload at the configured size limit, and just over it (500 MB boundary if the cap is raised to 500) | At the limit succeeds; over it is rejected |
+| 11 | Upload at the configured size limit, and just over it (300 MB in production) | At the limit succeeds; over it is rejected |
 | 12 | Upload a file whose contents do not match its type | Rejected |
 | 13 | Upload with no product selected | Rejected |
 | 14 | Inspect the stored object in MinIO | Bucket and key follow `{ingest_line}/{product.slug}/{sanitized_filename}` |
@@ -449,19 +471,41 @@ tests pass. It has not been deployed anywhere. The image has never been
 built, and `deploy/admin.nomad.hcl` is a draft that has never been validated
 and is **not safe to submit as it is**.
 
-### G1. Decisions needed first
+### Responsibility
 
-Nothing below can be finished without these. Each needs one explicit answer.
+Friendy has confirmed that he handles the remaining infrastructure and
+deployment work:
+
+- Vault;
+- the MinIO and Qdrant runtime configuration;
+- Nomad networking;
+- Docker image publishing;
+- APISIX and Cloudflare;
+- the staging and production deployments.
+
+Nothing in that list is resolved or guessed in this repository. The sections
+below record what the application needs from each, so that the work can be
+done from one place.
+
+Settled since the first handoff, with no application change needed:
+
+- **Keycloak callback and logout URLs.** The supplied URLs are handled by the
+  local server; the Auth.js routes are unchanged. See [G5](#g5-keycloak-uris).
+- **Production upload cap.** 300 MB, set in the job draft. See
+  [G7](#g7-upload-limits).
+
+### G1. Deployment decisions
+
+These are Friendy's to make as part of the deployment work. None is an
+application decision, and nothing below can be finished without them.
 
 | # | Decision | Why it blocks |
 | --- | --- | --- |
-| 1 | Keycloak callback and logout URIs: register the application's URIs, or change the application to the supplied ones | Sign-in fails at the callback if the registered URI differs. See [G5](#g5-keycloak-uris). |
-| 2 | How Nomad reads the Vault secret: KV engine version, whether `keycloak_client_secret` is a secret or a field, and the Vault role or policy for the job | The job has no secret injection. See [G4](#g4-environment-and-secrets). |
-| 3 | Values or sources for `AUTH_SECRET`, MinIO and Qdrant | Authentication, uploads and status do not work without them. |
-| 4 | Host port and network mode | The draft binds host port 3000 on `auraplex01`. See [G6](#g6-networking). |
-| 5 | Final upload size cap | Sets `ADMIN_UPLOAD_MAX_MB` and the ingress body limit. See [G7](#g7-upload-limits). |
-| 6 | Image tag strategy and how the image reaches `auraplex01` | Decides what CI publishes. See [G3](#g3-what-ci-must-build-and-publish). |
-| 7 | Staging identity: job, node, image | Only the staging hostname exists. See [G9](#g9-staging-checks). |
+| 1 | How Nomad reads the Vault secret: KV engine version, whether `keycloak_client_secret` is a secret or a field, and the Vault role or policy for the job | The job has no secret injection. See [G4](#g4-environment-and-secrets). |
+| 2 | Values or sources for `AUTH_SECRET`, MinIO and Qdrant | Authentication, uploads and status do not work without them. |
+| 3 | Host port and network mode | The draft binds host port 3000 on `auraplex01`. See [G6](#g6-networking). |
+| 4 | Image tag strategy and how the image reaches `auraplex01` | Decides what CI publishes. See [G3](#g3-what-ci-must-build-and-publish). |
+| 5 | Staging identity: job, node, image | Only the staging hostname exists. See [G9](#g9-staging-checks). |
 
 ### G2. Building the image
 
@@ -474,7 +518,11 @@ docker build -t auraplex.local/admin-upload:v1 .
 - The build needs no secrets and no build arguments. Do not pass any secret
   as a build argument; every secret is read at runtime.
 - The one optional build argument is `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB`, a
-  UI-only ceiling. Leave it out so the UI follows the server's runtime cap.
+  UI-only ceiling that is fixed into the image when it is built. Left out,
+  the UI follows the server's runtime cap, which is 300 MB in production. If
+  the production build passes it, the value must be `300`
+  (`--build-arg NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB=300`); a lower value holds
+  the UI below the server cap. See [G7](#g7-upload-limits).
 - `.dockerignore` keeps local `.env` files out of the build context.
 - The image runs as the unprivileged `node` user and listens on port 3000.
 
@@ -505,7 +553,9 @@ The repository has one workflow today, `.github/workflows/secrets-scan.yml`
    connections.
 3. Run `npm run build`.
 4. Build the image as in [G2](#g2-building-the-image) and run the container
-   smoke test.
+   smoke test. For the production image, `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB`
+   must be either absent from the build or set to `300`; it must not be set
+   to a lower value, in the build arguments or in the CI environment.
 5. Publish the image under the name the job uses,
    `auraplex.local/admin-upload`, somewhere Docker on `auraplex01` can pull
    it from.
@@ -542,10 +592,10 @@ a missing one shows up when the feature that needs it is used.
 | `MINIO_REGION` | S3 region name sent to MinIO | no | `us-east-1` | no | job `env`, only to override | nothing, unless MinIO uses another region |
 | `QDRANT_URL` | Qdrant endpoint, for processing status and delete | yes, for status and delete | none | no | job `env`; value not supplied | provide |
 | `QDRANT_API_KEY` | Qdrant API key | only if Qdrant requires a key | none | **yes** | runtime secret injection; store not specified | provide if Qdrant requires one |
-| `ADMIN_UPLOAD_MAX_MB` | Server-enforced per-file size cap | no | `100` (range 1–500) | no | job `env` | set once the cap is decided |
+| `ADMIN_UPLOAD_MAX_MB` | Server-enforced per-file size cap, read at runtime | no | `100` (range 1–500) | no | job `env` (production value `300` is in the draft) | nothing for production; set it in the staging job |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | Concurrent uploads per process | no | `4` (range 1–16) | no | job `env`, only to override | decide whether 4 fits in 512 MB |
 | `ADMIN_TRUSTED_PROXY_SECRET` | Lets audit logging trust `cf-connecting-ip` | no; only with matching APISIX configuration | unset | **yes** | runtime secret injection, only if used | leave unset unless APISIX strips and injects the header |
-| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | UI-only upload ceiling, fixed when the image is built | no | unset | no | Docker build argument | leave unset |
+| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | UI-only upload ceiling, fixed when the image is built | no | unset | no | Docker build argument | leave unset, or set `300` for the production build; never lower |
 | `NODE_ENV` | Must be `production`: enables HTTPS-only cookies and logout | yes | `production` in the image | no | image and job `env` | nothing |
 | `PORT` | Port the server listens on | yes | `3000` in the image | no | image and job `env` | nothing; see [G6](#g6-networking) |
 | `HOSTNAME` | Address the server binds to | yes | `0.0.0.0` in the image | no | image and job `env` | nothing |
@@ -569,21 +619,21 @@ Secrets needing runtime injection: `AUTH_SECRET`, `KEYCLOAK_CLIENT_SECRET`,
 
 ### G5. Keycloak URIs
 
-**BLOCKED / awaiting Friendy confirmation.** The application is unchanged
-and uses:
+**Settled; no application change.** Friendy confirmed that the callback and
+logout URLs he supplied are handled by the local server, so the current
+Auth.js routes remain unchanged. The application sends:
 
 | Environment | Redirect URI (callback) | Post-logout redirect URI |
 | --- | --- | --- |
 | Production | `https://admin-auraplex.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex.auraplex.info/signed-out` |
 | Staging | `https://admin-auraplex-staging.auraplex.info/api/auth/callback/keycloak` | `https://admin-auraplex-staging.auraplex.info/signed-out` |
 
-The URIs supplied for the client were `/api/auth/callback` and
-`/api/auth/logout` on the same hosts. The application has neither route. If
-the application stays as it is, the four URIs in the table are the ones that
-must be registered on client `auraplex-admin-upload`. If the supplied URIs
-are to be used instead, the application has to change first, and that has not
-been done. The comparison is in
-[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris--blocked).
+The URLs supplied for the client were `/api/auth/callback` and
+`/api/auth/logout` on the same hosts. The application itself has neither
+route and is not being changed to add them. How the local server handles the
+supplied URLs, and what is registered on client `auraplex-admin-upload`, are
+Friendy's and are not described in this repository. The comparison is in
+[Keycloak callback and logout URIs](#keycloak-callback-and-logout-uris).
 
 The client must also issue refresh tokens, rotate them on every use, and put
 `groups` in the ID token; see [Keycloak client](#keycloak-client).
@@ -627,19 +677,43 @@ authentication.
 
 ### G7. Upload limits
 
-The final cap is not decided. Until it is, the server default of 100 MB
-applies and the job sets nothing.
+**The production upload cap is 300 MB**, confirmed by Friendy. 100 MB was
+acceptable for testing and remains the application's fallback when nothing
+is configured. The upload code is unchanged; only configuration differs.
 
-Once a value is chosen:
+Two settings are involved, and they are read at different times:
 
-1. Set `ADMIN_UPLOAD_MAX_MB` in the job to that value (1–500). The UI follows
-   it without a rebuild.
-2. Make APISIX, Cloudflare and anything else in the path allow request bodies
-   of at least that size.
-3. Leave `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` unset.
+| | Server limit | Client (UI) ceiling |
+| --- | --- | --- |
+| Variable | `ADMIN_UPLOAD_MAX_MB` | `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` |
+| Read | at **runtime**, on each request | at **build** time; fixed into the image |
+| Set in | the Nomad job `env` | a Docker build argument, in CI |
+| Enforces | yes: the server rejects larger files | no: it only limits what the UI offers |
+| Unset | 100 MB (application fallback) | no ceiling; the UI follows the server limit |
+| Production | `300`, set in `deploy/admin.nomad.hcl` | unset, or `300` |
+
+The UI shows the lower of the two values. With the build-time ceiling unset,
+the server passes its runtime limit to the page, so the UI shows 300 MB in
+production with no rebuild and no build argument. The build-time value is
+therefore not required. It only matters if it is set: a value below 300
+would make the UI refuse files the server accepts, and a value above 300
+changes nothing.
+
+For production:
+
+1. `ADMIN_UPLOAD_MAX_MB = "300"` is set in the job draft. Keep it.
+2. Build the production image with `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` unset or
+   set to `300`. Check that CI does not carry a lower value over from a test
+   configuration.
+3. Make APISIX, Cloudflare and anything else in the path allow request bodies
+   of at least 300 MB. This has not been verified, and Cloudflare's limit
+   depends on the plan; see the [runtime notes](AURA-INT-001-runtime.md).
 4. Decide `ADMIN_UPLOAD_MAX_CONCURRENT`. The default of 4 was measured
    against a 1024 MB task; the job has 512 MB, and that combination has not
    been measured.
+
+An environment that sets neither variable, such as a test deployment, gets
+100 MB on both sides.
 
 ### G8. The Nomad job
 
@@ -648,8 +722,8 @@ done. It must not be submitted before then; see
 [The Nomad job draft](#the-nomad-job-draft).
 
 1. Add the runtime secret injection ([G4](#g4-environment-and-secrets)).
-2. Add `MINIO_ENDPOINT` and `QDRANT_URL`, and the upload settings from
-   [G7](#g7-upload-limits).
+2. Add `MINIO_ENDPOINT` and `QDRANT_URL`. The 300 MB upload cap is already
+   set; see [G7](#g7-upload-limits) for the concurrency setting.
 3. Settle the network block ([G6](#g6-networking)).
 4. Decide whether an update policy is needed so that an old and a new
    allocation cannot overlap. `count = 1` must stay; canary and scaling
@@ -659,8 +733,8 @@ done. It must not be submitted before then; see
 
 Already in the file and confirmed: job `admin-upload`, group `web`, service
 `admin-upload`, datacenter `acumen-local`, node `auraplex01`, image
-`auraplex.local/admin-upload:v1`, CPU 500, memory 512 MB, one instance, and
-the `GET /api/health` check.
+`auraplex.local/admin-upload:v1`, CPU 500, memory 512 MB, one instance, the
+300 MB upload cap, and the `GET /api/health` check.
 
 The health check is liveness only. It passes with no secrets and with
 Keycloak, MinIO and Qdrant unreachable, so a healthy allocation is not proof
@@ -670,8 +744,10 @@ of a working deployment.
 
 No staging environment is defined: there is no staging job, node or image,
 only the hostname `admin-auraplex-staging.auraplex.info`. Staging needs its
-own job with `AUTH_URL` set to `https://admin-auraplex-staging.auraplex.info`
-and the staging URIs registered in Keycloak.
+own job with `AUTH_URL` set to `https://admin-auraplex-staging.auraplex.info`,
+the Keycloak client set up for the staging host
+([G5](#g5-keycloak-uris)), and an explicit `ADMIN_UPLOAD_MAX_MB` if staging
+is to be tested at the production cap of 300 MB.
 
 Before production, on staging:
 

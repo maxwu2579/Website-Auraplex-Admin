@@ -1,6 +1,6 @@
 # Auraplex Admin Upload — User Guide
 
-Open `/admin/upload` and sign in with the company Keycloak account. Select a business line (**Labelling, Packaging, Automation, Software or Consulting**) and a product, then drop files or choose **Browse files**. Review the queue and choose **Upload**. Each file is limited to **100 MB** unless your administrator configured a different limit. Accepted formats are **PDF, DOCX, PNG, JPG/JPEG and MP4**; the file contents must match the extension and declared media type.
+Open `/admin/upload` and sign in with the company Keycloak account. Select a business line (**Labelling, Packaging, Automation, Software or Consulting**) and a product, then drop files or choose **Browse files**. Review the queue and choose **Upload**. Each file is limited to **300 MB** in production; where no limit has been configured, it is 100 MB. The upload page shows the limit that applies. Accepted formats are **PDF, DOCX, PNG, JPG/JPEG and MP4**; the file contents must match the extension and declared media type.
 
 Software and Consulting are listed but have **no products configured yet**, so files cannot be uploaded to them until real products are added. Labelling, Packaging and Automation products are stored under the shared `machines` knowledge area.
 

@@ -103,8 +103,9 @@ can be uploaded to them; add real records only, never placeholders.
   (`KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`).
 - The application sends the redirect URI
   `<AUTH_URL>/api/auth/callback/keycloak` and the post-logout redirect URI
-  `<AUTH_URL>/signed-out`. Their registration on the Keycloak client is
-  **blocked** pending a decision; see the deployment document.
+  `<AUTH_URL>/signed-out`. These differ from the callback and logout URLs
+  Friendy supplied; he has confirmed that those are handled by the local
+  server, so the Auth.js routes are unchanged. See the deployment document.
 
 Sessions end after 30 minutes without activity and 12 hours after sign-in.
 Every session is re-verified with Keycloak once its last verification is 60
@@ -134,7 +135,8 @@ server-only and read at runtime, except the optional
 | `QDRANT_URL` | Required for processing status and delete; uploads work without it. |
 | `QDRANT_API_KEY` | Conditional: only if Qdrant requires a key. |
 | `KEYCLOAK_UPLOADER_ROLE`, `KEYCLOAK_ADMIN_ROLE`, `MINIO_REGION` | Optional; defaulted. |
-| `ADMIN_UPLOAD_MAX_MB` | Optional. Server-enforced per-file cap, 1–500, default 100. |
+| `ADMIN_UPLOAD_MAX_MB` | Optional. Server-enforced per-file cap, read at runtime; 1–500, default 100. Production is 300, set in the job draft. |
+| `NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB` | Optional. Build-time UI-only ceiling; unset, the UI follows the runtime cap. In a production build it must be unset or 300. |
 | `ADMIN_UPLOAD_MAX_CONCURRENT` | Optional. Concurrent uploads per process, 1–16, default 4. |
 | `ADMIN_TRUSTED_PROXY_SECRET` | Conditional; see the runtime notes before setting. |
 
@@ -195,31 +197,38 @@ Nothing is deployed: there has been no production deployment and no staging
 deployment. The confirmed values, the open items and the production smoke
 tests are in `docs/deployment/AURAPLEX-ADMIN-deployment.md`. Section G of
 that document is the handoff list: building the image, what CI must do, the
-environment and secrets, and the decisions still needed.
+environment and secrets, and the deployment decisions still to be made.
 
 - **Confirmed by Friendy and wired** into `deploy/admin.nomad.hcl`, a draft
   of the production job: the production hostname
   `admin-auraplex.auraplex.info` (as `AUTH_URL`), the Keycloak issuer and
-  client ID, and the Nomad job, service, internal port, datacenter, node,
-  image and resources, as a single instance.
+  client ID, the Nomad job, service, internal port, datacenter, node, image
+  and resources, as a single instance, and the production upload cap of
+  300 MB (`ADMIN_UPLOAD_MAX_MB`).
 - **Confirmed but only documented:** the staging hostname
   `admin-auraplex-staging.auraplex.info`. No staging job exists.
+- **Confirmed, no application change:** the Keycloak callback and logout URLs
+  Friendy supplied are handled by the local server. The Auth.js routes stay
+  as they are.
 
 The draft is not production-ready and must not be submitted to Nomad. Nothing
 in the file prevents Nomad from accepting it, and the health check would pass
 even without the secrets.
 
-Still open before a first deployment:
+Friendy has confirmed that he handles the remaining infrastructure and
+deployment work: Vault, the MinIO and Qdrant runtime configuration, Nomad
+networking, Docker image publishing, APISIX and Cloudflare, and the staging
+and production deployments. No application-side decision is outstanding.
 
-- **Blocked:** which callback and logout URIs are registered on the Keycloak
-  client. The supplied URIs differ from the ones the application uses.
+Still open before a first deployment, all within that work:
+
 - Runtime secret injection. The Keycloak client secret comes from Vault
   (`kv/auraplex/admin-upload/keycloak_client_secret`); the Nomad wiring and
   the other secrets and service addresses are not in place.
 - The host port and network mapping. Only the internal port, 3000, is
   confirmed.
-- The final upload size cap, and confirmation that the ingress allows request
-  bodies of that size without buffering them.
+- Confirmation that the ingress allows request bodies of the 300 MB upload
+  cap without buffering them.
 - A real Docker build and container smoke test; none has been run.
 - The end-to-end checks listed as unverified in
   `docs/deployment/AURA-INT-001-runtime.md`: real Keycloak, MinIO, Qdrant and

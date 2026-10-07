@@ -12,28 +12,33 @@
 # allocation can look healthy while sign-in and uploads cannot work.
 #
 # Deployment blockers (details in section E of
-# docs/deployment/AURAPLEX-ADMIN-deployment.md):
+# docs/deployment/AURAPLEX-ADMIN-deployment.md). Friendy has confirmed that
+# he handles this remaining infrastructure and deployment work; none of it
+# needs a further application decision, and none of it is guessed here:
 #
 #   1. Runtime secret injection is not wired (see the TODO in the task
 #      below). KEYCLOAK_CLIENT_SECRET, AUTH_SECRET and the MinIO and Qdrant
 #      settings are absent.
-#   2. The Keycloak callback and logout URI registration is BLOCKED, awaiting
-#      Friendy's confirmation.
-#   3. The final upload size cap is not decided.
-#   4. The host port / network mapping is not confirmed (see the network
+#   2. The host port / network mapping is not confirmed (see the network
 #      block). Only the internal application port, 3000, is.
-#   5. The image has never been built or started: no Docker build and no
+#   3. The image has never been built or started: no Docker build and no
 #      container smoke test have been run.
-#   6. This file has never been validated. `nomad job validate` has not been
+#   4. This file has never been validated. `nomad job validate` has not been
 #      run on it (Nomad was not available where it was prepared) and it has
 #      not been run anywhere.
-#   7. The APISIX route and Cloudflare Tunnel configuration are not in this
-#      repository.
+#   5. The APISIX route and Cloudflare Tunnel configuration are not in this
+#      repository. They must allow request bodies of at least the 300 MB
+#      upload cap set below.
+#
+# Settled, and no longer blockers: Friendy confirmed that the Keycloak
+# callback and logout URLs he supplied are handled by the local server, so the
+# application's Auth.js routes are unchanged; and the production upload cap is
+# 300 MB.
 #
 # What is confirmed and set below: job, group, service, internal port,
-# datacenter, node, image, resources, single instance, health path, and the
-# production AUTH_URL, Keycloak issuer and client ID. This is the production
-# job only; no staging job exists.
+# datacenter, node, image, resources, single instance, health path, the
+# production AUTH_URL, Keycloak issuer and client ID, and the 300 MB upload
+# cap. This is the production job only; no staging job exists.
 #
 # It deliberately does not reuse the public website's identity (its job,
 # service or image names), so applying it can never replace that job. Do not
@@ -100,12 +105,16 @@ job "admin-upload" {
         KEYCLOAK_ISSUER    = "https://keycloak.auraplex.info/realms/auraplex"
         KEYCLOAK_CLIENT_ID = "auraplex-admin-upload"
 
-        # Upload size: ADMIN_UPLOAD_MAX_MB is the server-enforced RUNTIME cap
-        # (default 100 MB, range 1-500) and the admin UI follows it without a
-        # rebuild. It is deliberately not set here: the final production cap
-        # has not been confirmed, so the 100 MB default applies.
-        # NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB is an optional build-time UI-only
-        # ceiling; leave it unset unless the UI must stay lower.
+        # Upload size, confirmed: the production cap is 300 MB.
+        # ADMIN_UPLOAD_MAX_MB is the server-enforced RUNTIME cap (range
+        # 1-500; the application default, used when it is unset, is 100 MB)
+        # and the admin UI follows it without a rebuild.
+        # NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB is a separate BUILD-time, UI-only
+        # ceiling inlined into the image; it cannot be set from this file.
+        # The production image must be built with it unset or equal to 300:
+        # a lower value would hold the UI below this cap.
+        ADMIN_UPLOAD_MAX_MB = "300"
+
         # ADMIN_UPLOAD_MAX_CONCURRENT (default 4, range 1-16) caps concurrent
         # uploads PER ALLOCATION/PROCESS; it is not a cluster-wide limit. The
         # default was sized for a 1024 MB task, not the 512 MB below.

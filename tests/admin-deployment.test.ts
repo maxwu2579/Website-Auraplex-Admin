@@ -263,11 +263,18 @@ test('the confirmed hostnames, issuer, client and secret path are documented', (
   assert.match(deploymentDoc, /\| Production \| `admin-auraplex\.auraplex\.info` \| Consul service `admin-upload`, internal port `3000` \|/);
 });
 
-test('the disputed callback and logout URIs are documented as blocked', () => {
-  const start = deploymentDoc.indexOf('### Keycloak callback and logout URIs — BLOCKED');
+test('the callback and logout URIs are documented as settled without an application change', () => {
+  const start = deploymentDoc.indexOf('### Keycloak callback and logout URIs\n');
   assert.notEqual(start, -1);
-  const section = deploymentDoc.slice(start, deploymentDoc.indexOf('\n### ', start + 1));
-  assert.match(section, /BLOCKED \/ awaiting Friendy confirmation/);
+  // Recorded with the confirmed values, before the list of open items.
+  assert.ok(start > deploymentDoc.indexOf('## D. Confirmed deployment values'));
+  assert.ok(start < deploymentDoc.indexOf('## E. Unresolved'));
+  const section = deploymentDoc.slice(start, deploymentDoc.indexOf('\n## ', start + 1));
+  assert.match(section, /Friendy confirmed that the callback and\nlogout URLs he supplied are handled by the local server/);
+  assert.match(section, /Auth\.js\nroutes therefore remain unchanged/);
+  // How the local server handles them is not described, let alone invented.
+  assert.match(section, /is not part of this\n  repository and is not described here/);
+  for (const text of [deploymentDoc, job, read('README.md')]) assert.doesNotMatch(text, /\bBLOCKED\b/i);
   for (const host of [PRODUCTION_HOST, STAGING_HOST]) {
     for (const path of ['/api/auth/callback', '/api/auth/logout', '/api/auth/callback/keycloak', '/signed-out']) {
       assert.ok(section.includes(`\`https://${host}${path}\``), `${host}${path}`);
@@ -275,7 +282,7 @@ test('the disputed callback and logout URIs are documented as blocked', () => {
   }
 });
 
-test('the disputed callback and logout routes are unchanged in the application', () => {
+test('the callback and logout routes are unchanged in the application', () => {
   // Auth.js still owns /api/auth/*; no hand-written callback or logout route exists.
   assert.equal(exists('app', 'api', 'auth', '[...nextauth]', 'route.ts'), true);
   assert.equal(exists('app', 'api', 'auth', 'callback'), false);
@@ -286,15 +293,30 @@ test('the disputed callback and logout routes are unchanged in the application',
   assert.match(logout, /post_logout_redirect_uri/);
   assert.match(logout, /ADMIN_SIGNED_OUT_PATH/);
   assert.doesNotMatch(logout, /api\/auth\/logout/);
-  // Neither disputed URI is configured anywhere a deployment would read it.
+  // Neither supplied URL is configured anywhere a deployment would read it.
   for (const text of [jobConfig, envExample]) {
     assert.doesNotMatch(text, /\/api\/auth\/(?:callback|logout)/);
   }
 });
 
-test('the final upload cap is left open and not set by the job', () => {
-  assert.equal(jobConfig.includes('ADMIN_UPLOAD_MAX_MB'), false);
-  assert.match(deploymentDoc, /\| 1 \| Final production upload cap \| Not decided\./);
+test('the job sets the confirmed 300 MB production upload cap', () => {
+  const env = block(jobConfig, /\benv\s*\{/);
+  assert.match(env, /^\s*ADMIN_UPLOAD_MAX_MB\s*=\s*"300"$/m);
+  // The build-time UI ceiling cannot be set at runtime, so the job leaves it out.
+  assert.equal(jobConfig.includes('NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB'), false);
+  assert.match(deploymentDoc, /\| Production upload cap \| 300 MB \| yes, `ADMIN_UPLOAD_MAX_MB = "300"` in the job draft \|/);
+  assert.doesNotMatch(deploymentDoc, /cap is not decided|Final production upload cap \| Not decided/);
+});
+
+test('the runtime server limit and the build-time UI ceiling are documented separately', () => {
+  const start = deploymentDoc.indexOf('### G7. Upload limits');
+  assert.notEqual(start, -1);
+  const section = deploymentDoc.slice(start, deploymentDoc.indexOf('\n### ', start + 1));
+  assert.match(section, /\| Read \| at \*\*runtime\*\*, on each request \| at \*\*build\*\* time; fixed into the image \|/);
+  assert.match(section, /\| Production \| `300`, set in `deploy\/admin\.nomad\.hcl` \| unset, or `300` \|/);
+  assert.match(section, /remains the application's fallback/);
+  assert.match(envExample, /Production \(confirmed: 300 MB; set in deploy\/admin\.nomad\.hcl\): 300/);
+  assert.match(envExample, /Production build: leave unset, or set 300\./);
 });
 
 test('the handoff section lists every environment variable and marks the secrets', () => {
@@ -337,7 +359,9 @@ test('the handoff section does not present the job or the image as ready', () =>
   assert.match(handoff, /\*\*not safe to submit as it is\*\*/);
   assert.match(handoff, /It has not been deployed anywhere/);
   assert.match(handoff, /This build has \*\*never been run\*\*/);
-  assert.match(handoff, /\*\*BLOCKED \/ awaiting Friendy confirmation\.\*\*/);
+  // Friendy owns the remaining infrastructure and deployment work.
+  assert.match(handoff, /^### Responsibility$/m);
+  assert.match(handoff, /Friendy has confirmed that he handles the remaining infrastructure and\ndeployment work/);
   assert.match(handoff, /docker build -t auraplex\.local\/admin-upload:v1 \./);
 });
 

@@ -16,8 +16,9 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Optional build-time UI-only upload ceiling. NEXT_PUBLIC_* values are inlined
-# by Next at BUILD time; leave this unset so the UI follows the server's
-# runtime ADMIN_UPLOAD_MAX_MB.
+# by Next at BUILD time. Unset, the UI follows the server's runtime
+# ADMIN_UPLOAD_MAX_MB (300 in production). If the production build sets it,
+# it must be 300: a lower value holds the UI below the server cap.
 ARG NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB
 ENV NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB=$NEXT_PUBLIC_ADMIN_UPLOAD_MAX_MB
 
