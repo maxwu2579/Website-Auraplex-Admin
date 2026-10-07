@@ -25,10 +25,12 @@ interface BodyOptions {
   failAfter?: number;
   /** Stop sending, but keep the stream open, after this many bytes. */
   stallAfter?: number;
+  /** Size of each chunk; 16 KiB unless a test needs the bytes to arrive differently. */
+  chunkBytes?: number;
 }
 
-/** PDF-signed body of `total` bytes in 16 KiB chunks. */
-function pdfBody(total: number, { failAfter, stallAfter }: BodyOptions = {}): ReadableStream<Uint8Array> {
+/** PDF-signed body of `total` bytes in 16 KiB chunks, or `chunkBytes` when given. */
+function pdfBody(total: number, { failAfter, stallAfter, chunkBytes = 16 * 1024 }: BodyOptions = {}): ReadableStream<Uint8Array> {
   let sent = 0;
   return new ReadableStream<Uint8Array>({
     pull(controller) {
@@ -41,7 +43,7 @@ function pdfBody(total: number, { failAfter, stallAfter }: BodyOptions = {}): Re
         controller.close();
         return;
       }
-      const chunk = new Uint8Array(Math.min(16 * 1024, total - sent)).fill(0x20);
+      const chunk = new Uint8Array(Math.min(chunkBytes, total - sent)).fill(0x20);
       if (sent === 0) chunk.set(PDF_HEADER.subarray(0, chunk.byteLength));
       sent += chunk.byteLength;
       controller.enqueue(chunk);
@@ -124,6 +126,52 @@ function deps(overrides: Partial<UploadServiceDependencies> = {}): Partial<Uploa
 
 async function code(response: Response): Promise<string | undefined> {
   return ((await response.json()) as { code?: string }).code;
+}
+
+/** Far longer than any idle timeout used here, so it only ends an upload that is stuck. */
+const UPLOAD_DEADLINE_MS = 2_000;
+/** How long an upload gets to unwind once its request has been aborted. */
+const ABORT_GRACE_MS = 500;
+
+/**
+ * Awaits an upload that must end by itself, and fails if it has not ended by
+ * a deadline. `start` receives the signal to put on its request.
+ *
+ * The application's idle timer is unref'd, so it does not keep the process
+ * alive. In a test with no server and no socket, an upload that waits on that
+ * timer would let the event loop drain: the process would exit, cancelling
+ * this test and every test after it. The deadline is an ordinary, ref'd timer
+ * that keeps the process alive while the upload runs, and it turns an upload
+ * that never ends into a failure of this test alone. It does not stand in for
+ * the idle timeout: whatever response the upload produces is returned as it
+ * is, for the caller to assert on.
+ */
+async function withinDeadline(
+  name: string,
+  start: (signal: AbortSignal) => Promise<Response>,
+  deadlineMs = UPLOAD_DEADLINE_MS,
+): Promise<Response> {
+  const controller = new AbortController();
+  const timers: Array<ReturnType<typeof setTimeout>> = [];
+  const after = (ms: number) => new Promise<'expired'>((resolve) => { timers.push(setTimeout(() => resolve('expired'), ms)); });
+
+  const upload = start(controller.signal);
+  // Observed here so that a late rejection, after the deadline, is never unhandled.
+  const settled = upload.then(() => 'settled' as const, () => 'settled' as const);
+  try {
+    if (await Promise.race([settled, after(deadlineMs)]) === 'settled') return await upload;
+
+    // Stuck. Abort the request so its streams, idle timer and upload slot are
+    // released, and give that a bounded time rather than waiting on it.
+    controller.abort();
+    const unwound = await Promise.race([settled, after(ABORT_GRACE_MS)]) === 'settled';
+    throw new Error(
+      `${name}: the upload did not end within ${deadlineMs} ms` +
+      (unwound ? '' : `, and was still running ${ABORT_GRACE_MS} ms after its request was aborted`),
+    );
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+  }
 }
 
 // --- Concurrency guard -----------------------------------------------------
@@ -224,7 +272,10 @@ test('the slot is released after every failure mode, with no permanent leak', as
     },
     {
       name: 'stalled client (idle timeout)',
-      run: () => putUpload(uploadRequest(512 * 1024, { stallAfter: 64 * 1024 }), deps({ concurrency, idleTimeoutMs: 50 })),
+      run: () => withinDeadline('stalled client', (signal) => putUpload(
+        uploadRequest(512 * 1024, { stallAfter: 64 * 1024, signal }),
+        deps({ concurrency, idleTimeoutMs: 50 }),
+      )),
       status: 408,
       code: 'REQUEST_TIMEOUT',
     },
@@ -309,6 +360,47 @@ test('a failed upload settles to the bytes that actually arrived', async () => {
   assert.ok(charged >= 64 * 1024 && charged <= 128 * 1024, `charged ${charged}`);
   // The full per-file reservation was released back to the hourly budget.
   assert.ok(charged < MAX_UPLOAD);
+});
+
+test('a stalled upload settles its 1 MiB reservation to the 64 KiB that arrived', async () => {
+  const limiter = new InMemoryUploadRateLimiter();
+  const concurrency = new UploadConcurrencyGuard(() => 1);
+  let reservedWhileUploading = -1;
+  // All 64 KiB arrive as the first chunk, PDF header included, and the client
+  // stalls straight after. The idle timer is already running while the type
+  // is detected, so bytes split over several chunks could be cut short by a
+  // slow detection; one chunk is counted in full whenever the timeout fires.
+  const response = await withinDeadline('stalled client with a real limiter', (signal) => putUpload(
+    uploadRequest(512 * 1024, { stallAfter: 64 * 1024, chunkBytes: 64 * 1024, signal }),
+    deps({
+      rateLimiter: limiter,
+      concurrency,
+      idleTimeoutMs: 50,
+      storage: () => ({
+        ...drainingStorage,
+        async putObject(input) {
+          reservedWhileUploading = hourBytes(limiter);
+          await drain(input.body);
+          return {};
+        },
+      }),
+    }),
+  ));
+  assert.equal(response.status, 408);
+  assert.equal(await code(response), 'REQUEST_TIMEOUT');
+  // No Content-Length, so the whole per-file maximum was reserved up front.
+  assert.equal(reservedWhileUploading, MAX_UPLOAD);
+  // The slot is free again, but the bytes that arrived stay charged: the
+  // reservation is replaced by them, neither kept at 1 MiB nor dropped to 0.
+  assert.equal(concurrency.inUse, 0);
+  assert.equal(hourBytes(limiter), 64 * 1024);
+  assert.equal(eventsOf(limiter).get('user-1')?.length, 1, 'one upload recorded, nothing left reserved');
+
+  // The same user can upload again, and is charged for exactly both uploads.
+  const next = await putUpload(uploadRequest(16 * 1024, { declare: true }), deps({ rateLimiter: limiter, concurrency }));
+  assert.equal(next.status, 200);
+  assert.equal(hourBytes(limiter), 64 * 1024 + 16 * 1024);
+  assert.equal(concurrency.inUse, 0);
 });
 
 test('near the 5 GiB hourly quota, declarations must fit and unknown lengths shrink', () => {
